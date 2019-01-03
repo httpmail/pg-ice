@@ -1,0 +1,6 @@
+Debug/*.*
+ice/Debug/
+ice/abc.log
+ice/x64/
+*.user
+.vs/
