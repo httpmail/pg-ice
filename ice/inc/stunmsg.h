@@ -73,6 +73,7 @@ namespace STUN {
         bool SendData(ICE::Channel& channel);
 
         const ATTR::MappedAddress*    GetAttribute(const ATTR::MappedAddress*& mapAddr) const;
+        const ATTR::XorMappedAddr*    GetAttribute(const ATTR::XorMappedAddr *& mapAddr) const;
         const ATTR::ChangeRequest*    GetAttribute(const ATTR::ChangeRequest*& changeReq) const;
         const ATTR::XorMappedAddress* GetAttribute(const ATTR::XorMappedAddress*& xorMap) const;
         const ATTR::Role*             GetAttribute(const ATTR::Role*& role) const;
@@ -120,6 +121,11 @@ namespace STUN {
 
     protected:
         uint16_t CalcAttrEncodeSize(uint16_t contentSize, uint16_t& paddingSize, uint16_t header_size = 4) const;
+
+        /*
+         * @ATTR::Id
+         * @uint16_t size - attribute total size include header
+         */
         uint8_t* AllocAttribute(ATTR::Id id, uint16_t size);
         void     AddTextAttribute(ATTR::Id id, const void* data, uint16_t size);
 
@@ -156,9 +162,13 @@ namespace STUN {
     ////////////////////////////// subsequent message //////////////////////////////
     class SubBindReqMsg : public MessagePacket  {
     public:
-        SubBindReqMsg(uint32_t pri, const TransId& transId, bool bControlling, uint64_t tieBreaker);
+        SubBindReqMsg(uint32_t pri, const TransId& transId, bool bControlling, uint64_t tieBreaker, const std::string& username, const std::string& pwd);
         SubBindReqMsg(const PACKET::stun_packet& packet, uint16_t packet_size);
-        virtual void Finalize() {}
+        virtual void Finalize() override;
+
+    private:
+        std::string m_Username;
+        std::string m_IcePwd;
     };
 
     class SubBindResqMsg : public MessagePacket {

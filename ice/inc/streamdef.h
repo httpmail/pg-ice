@@ -1,8 +1,8 @@
 #pragma once
 
 #include <stdint.h>
-#include <string>
 #include <vector>
+#include <string>
 
 namespace ICE {
 
@@ -22,7 +22,6 @@ namespace ICE {
             uint16_t    m_HostPort;
             std::string m_HostIP;
         };
-
         std::string             m_Name;
         std::vector<StreamAttr> m_StreamAttrs;
     };

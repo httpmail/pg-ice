@@ -46,6 +46,7 @@ namespace ICE {
 
     bool Media::CreateStream(uint8_t compId, Protocol protocol, const std::string & hostIP, uint16_t port, const CAgentConfig& config)
     {
+#if 0
         class EventHelper : public PG::CListener {
         public:
             EventHelper(Media* pOwner, Stream* pStream) :
@@ -104,6 +105,7 @@ namespace ICE {
 
         stream->UnregisterEventListenner(static_cast<uint16_t>(Stream::Message::Gathering), &helper);
         stream.release();
+#endif
         return true;
     }
 }

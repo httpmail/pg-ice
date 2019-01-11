@@ -1,12 +1,16 @@
 
 
+#define _WINSOCK_DEPRECATED_NO_WARNINGS
 #include "agent.h"
 #include "session.h"
 #include "pg_log.h"
 #include "sdp.h"
 #include <boost/asio.hpp>
 #include <thread>
-
+#include <iostream>
+#include< windows.h> 
+#include <WS2tcpip.h>
+#include "stunmsg.h"
 
 class Endpoint {
 public:
@@ -26,13 +30,85 @@ static std::condition_variable sCond;
 static bool bRecved = false;
 static std::string sOffer;
 
+
+void RecvThrd0(SOCKET* s)
+{
+    while (1)
+    {
+        char buf[1024];
+        memset(buf, 0, sizeof(buf));
+        auto bytes = recv(*s, buf, sizeof(buf), 0);
+        LOG_INFO("recvthrd0", "%s", buf);
+    }
+}
+
+
+void RecvThrd1(SOCKET* s)
+{
+    while (1)
+    {
+        char buf[1024];
+        memset(buf, 0, sizeof(buf));
+        auto bytes = recv(*s, buf, sizeof(buf), 0);
+        LOG_INFO("recvthrd1", "%s", buf);
+    }
+}
+
+class A1 {
+
+};
+
+class B1 : public A1 {
+
+};
+
+using C = std::set<B1*>;
 int main() 
 {
     ICE::CAgentConfig config;
     ICE::CAgent agent;
 
+    boost::asio::ip::tcp::socket s(sIOService);
+
+    boost::asio::ip::udp::socket s1(sIOService);
+
+    char mybuf[1024];
+    boost::asio::ip::udp::endpoint s1_ep;
+
+    boost::asio::ip::udp::endpoint s1_ep1(boost::asio::ip::address::from_string(config.DefaultIP()), 10000);
+
+    s1.open(s1_ep.protocol());
+    s1.bind(s1_ep1);
+    s1.receive_from(boost::asio::buffer(mybuf, sizeof(mybuf)), s1_ep);
+    boost::system::error_code ec;
+
+
     config.AddStunServer("64.235.150.11",3478);
-    //config.AddStunServer("216.93.246.18", 3478);
+    config.AddStunServer("216.93.246.18", 3478);
+
+    boost::asio::ip::address addr(boost::asio::ip::address::from_string("190.168.110.166"));
+    boost::asio::ip::address laddr(boost::asio::ip::address::from_string(config.DefaultIP()));
+
+    boost::asio::ip::tcp::endpoint ep(addr, 3478);
+
+    boost::asio::ip::tcp::endpoint local(laddr, 8888);
+    std::cout << local.port() << std::endl;
+    s.open(local.protocol());
+    s.bind(local, ec);
+
+    auto t1 = std::chrono::steady_clock::now();
+    s.connect(ep, ec);
+
+    auto take = std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now() - t1);
+
+    STUN::TransId id;
+    STUN::MessagePacket::GenerateRFC5389TransationId(id);
+    STUN::FirstBindReqMsg msg(id);
+
+    s.send(boost::asio::buffer(msg.GetData(), msg.GetLength()), 0);
+    std::thread
+    while (1);
+#if 0
 
     Endpoint ep(config.DefaultIP());
     ICE::Session session(config.DefaultIP());
@@ -52,7 +128,7 @@ int main()
         }
     };
     std::string offer;
-    if (session.CreateMedia(videoMedia, config)&&session.CreateMedia(audioMedia,config))
+    if (session.CreateMedia(videoMedia, config))
     {
 
         if (session.MakeOffer(offer))
@@ -97,8 +173,7 @@ int main()
     {
         assert(0);
     }
-    while (1);
-    return 1;
+#endif
 }
 
 Endpoint::Endpoint(const std::string& ip) :

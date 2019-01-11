@@ -4,14 +4,12 @@
 #include <map>
 #include <assert.h>
 
-#include "streamdef.h"
+#include "candidate.h"
 
 namespace ICE {
     class CAgentConfig;
     class Media;
     class Stream;
-    class Candidate;
-
     class Session
     {
     public:
@@ -92,41 +90,10 @@ namespace ICE {
         };
 
     public:
-        class CandidatePeer {
-        public:
-            CandidatePeer(uint64_t PRI, const Candidate* lcand, const Candidate* rcand);
-            virtual ~CandidatePeer();
-
-            void Priority(uint64_t pri) { m_PRI = pri; }
-            uint64_t Priority() const { return m_PRI; }
-
-            const Candidate* LCandidate() const { return m_LCand; }
-            const Candidate* RCandidate() const { return m_RCand; }
-
-            bool operator< (const CandidatePeer &other) const
-            {
-                if (other.m_LCand == m_LCand && other.m_RCand == m_RCand)
-                    return false;
-
-                if (other.m_PRI != m_PRI)
-                    return other.m_PRI < m_PRI;
-
-                if (other.m_LCand != m_LCand)
-                    return other.m_LCand < m_LCand;
-
-                return other.m_RCand < m_RCand;
-            }
-
-        private:
-            uint64_t m_PRI;
-            const Candidate *m_LCand;
-            const Candidate *m_RCand;
-        };
-
         struct StreamInfo {
         public:
-            StreamInfo(Stream* stream, const std::string& key, const std::string& username) :
-                m_pStream(stream), m_Key(key), m_Username(username)
+            StreamInfo(Stream* stream, const std::string & lpwd, const std::string & rpwd, const std::string& lufrag, const std::string& rufrag) :
+                m_pStream(stream), m_LPwd(lpwd), m_RPwd(rpwd), m_LUfrag(lufrag), m_RUfrag(rufrag)
             {
                 assert(stream);
             }
@@ -138,9 +105,11 @@ namespace ICE {
             }
 
         public:
-            Stream          *m_pStream;
-            std::string      m_Key;
-            std::string      m_Username;
+            Stream              *m_pStream;
+            const std::string   &m_LPwd;
+            const std::string   &m_RPwd;
+            const std::string   &m_LUfrag;
+            const std::string   &m_RUfrag;
         };
     public:
         using CandPeerContainer = std::set<CandidatePeer>;
@@ -161,7 +130,6 @@ namespace ICE {
     private:
         SessionConfig           m_Config;
         MediaContainer          m_Medias;
-        CandPeerContainer       m_CandPeers;
         CheckContainer          m_CheckList;
     };
 }

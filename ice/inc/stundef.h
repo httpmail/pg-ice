@@ -14,6 +14,7 @@ namespace STUN {
     static const uint32_t sIceUfragLength = 4; /*RFC5245 15.4*/
     static const uint32_t sSHA1Size = 20;
     static const uint32_t sMagicCookie = 0x2112A442;
+    static const uint32_t sStunXorFingerprint = 0x5354554e;
     static const uint16_t sIPv4PathMTU = 548;
     static const uint16_t sIPv6PathMTU = 1280;
     static const uint16_t sTransationLength = 16;
@@ -104,8 +105,9 @@ namespace STUN {
             Realm = 0x0014,
             Nonce = 0x0015,
 
-            XorMappedAddress = 0x8020,
+            XorMappedAddress = 0x0020,
 
+            XorMappedAdd = 0x8020, /* stun server used 8020 instead of 0x0020 which defined in RFC5389 */
             Software = 0x8022,
             AlternateServer = 0x8023,
             Priority = 0x0024, /* RFC8445 16.1 */
@@ -312,11 +314,15 @@ namespace STUN {
 
         class MessageIntegrity : public Header {
         public:
-            MessageIntegrity() :
+            MessageIntegrity(SHA1ConstRef sha1) :
                 Header(Id::MessageIntegrity, sSHA1Size)
-            {}
+            {
+                memcpy(m_SHA1, sha1, sSHA1Size);
+            }
 
             SHA1ConstRef SHA1() const { return m_SHA1; }
+
+            void SHA1(SHA1ConstRef sha1) { memcpy(m_SHA1, sha1, sSHA1Size); }
 
         private:
             STUN::SHA1 m_SHA1;
@@ -449,6 +455,55 @@ namespace STUN {
             uint8_t m_Nonce[0];
         };
 
+        class XorMappedAddr : public Header{
+        public:
+            XorMappedAddr() :
+                Header(Id::XorMappedAdd, 4)
+            {}
+
+            uint16_t Port() const
+            {
+                return static_cast<uint16_t>((sMagicCookie >> 16) ^ PG::network_to_host(static_cast<uint16_t>(m_Port)));
+            }
+
+            void Port(int16_t port)
+            {
+                m_Port = PG::host_to_network(static_cast<uint16_t>(port ^ (sMagicCookie >> 16)));
+            }
+
+            uint32_t Address() const
+            {
+                return static_cast<int32_t>(sMagicCookie ^ PG::network_to_host(static_cast<uint32_t>(m_Address)));
+            }
+
+            std::string IP() const
+            {
+                boost::asio::ip::address_v4 address(Address());
+                return address.to_string();
+            }
+
+            void Address(uint32_t address)
+            {
+                m_Address = PG::host_to_network(address ^ sMagicCookie);
+            }
+
+            AddressFamily Family() const
+            {
+                return  static_cast<AddressFamily>(m_Family);
+            }
+
+            const uint8_t* RawData() const
+            {
+                return reinterpret_cast<const uint8_t*>(this);
+            }
+
+        private:
+            unsigned : 8;
+            unsigned m_Family : 8;
+            unsigned m_Port : 16;
+            unsigned m_Address : 32;
+        };
+
         class XorMappedAddress : public Header {
         public:
             XorMappedAddress() :
@@ -532,6 +587,9 @@ namespace STUN {
             Fingerprint() :
                 Header(Id::Fingerprint, 4)
             {}
+
+            uint32_t CRC32() const { return PG::network_to_host(m_CRC32); }
+            void CRC32(uint32_t crc32) { m_CRC32 = PG::host_to_network(crc32); }
 
         private:
             uint32_t m_CRC32;

@@ -9,6 +9,8 @@
 #include <fstream>
 #include "pg_buffer.h"
 
+#define PG_LOG_ENABLE 1
+
 #define Enum2String(var) #var
 
 #define LOG_INFO(_module, _fmt, ...)     PG::log::Instance().Output(_module, __FILE__, __LINE__, Enum2String(PG::log::level::Info),    _fmt, ##__VA_ARGS__)

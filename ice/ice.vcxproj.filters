@@ -1,0 +1,130 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="..\main.cpp" />
+    <ClCompile Include="src\agent.cpp">
+      <Filter>ice</Filter>
+    </ClCompile>
+    <ClCompile Include="src\candidate.cpp">
+      <Filter>ice</Filter>
+    </ClCompile>
+    <ClCompile Include="src\channel.cpp">
+      <Filter>ice</Filter>
+    </ClCompile>
+    <ClCompile Include="src\media.cpp">
+      <Filter>ice</Filter>
+    </ClCompile>
+    <ClCompile Include="src\sdp.cpp">
+      <Filter>ice</Filter>
+    </ClCompile>
+    <ClCompile Include="src\session.cpp">
+      <Filter>ice</Filter>
+    </ClCompile>
+    <ClCompile Include="src\stream.cpp">
+      <Filter>ice</Filter>
+    </ClCompile>
+    <ClCompile Include="src\stunmsg.cpp">
+      <Filter>ice</Filter>
+    </ClCompile>
+    <ClCompile Include="src\stunprotocol.cpp">
+      <Filter>ice</Filter>
+    </ClCompile>
+    <ClCompile Include="..\pg\inc\pg_buffer.cpp">
+      <Filter>pg</Filter>
+    </ClCompile>
+    <ClCompile Include="..\pg\src\pg_log.cpp">
+      <Filter>pg</Filter>
+    </ClCompile>
+    <ClCompile Include="..\pg\src\pg_msg.cpp">
+      <Filter>pg</Filter>
+    </ClCompile>
+    <ClCompile Include="..\pg\src\pg_object.cpp">
+      <Filter>pg</Filter>
+    </ClCompile>
+    <ClCompile Include="..\pg\src\pg_timer.cpp">
+      <Filter>pg</Filter>
+    </ClCompile>
+    <ClCompile Include="..\pg\src\pg_util.cpp">
+      <Filter>pg</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ping.cpp">
+      <Filter>pg</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="inc\agent.h">
+      <Filter>ice</Filter>
+    </ClInclude>
+    <ClInclude Include="inc\candidate.h">
+      <Filter>ice</Filter>
+    </ClInclude>
+    <ClInclude Include="inc\channel.h">
+      <Filter>ice</Filter>
+    </ClInclude>
+    <ClInclude Include="inc\media.h">
+      <Filter>ice</Filter>
+    </ClInclude>
+    <ClInclude Include="inc\sdp.h">
+      <Filter>ice</Filter>
+    </ClInclude>
+    <ClInclude Include="inc\session.h">
+      <Filter>ice</Filter>
+    </ClInclude>
+    <ClInclude Include="inc\stream.h">
+      <Filter>ice</Filter>
+    </ClInclude>
+    <ClInclude Include="inc\streamdef.h">
+      <Filter>ice</Filter>
+    </ClInclude>
+    <ClInclude Include="inc\stundef.h">
+      <Filter>ice</Filter>
+    </ClInclude>
+    <ClInclude Include="inc\stunmsg.h">
+      <Filter>ice</Filter>
+    </ClInclude>
+    <ClInclude Include="inc\stunprotocol.h">
+      <Filter>ice</Filter>
+    </ClInclude>
+    <ClInclude Include="inc\icmp_header.h">
+      <Filter>pg</Filter>
+    </ClInclude>
+    <ClInclude Include="inc\ipv4_header.h">
+      <Filter>pg</Filter>
+    </ClInclude>
+    <ClInclude Include="..\pg\inc\pg_buffer.h">
+      <Filter>pg</Filter>
+    </ClInclude>
+    <ClInclude Include="..\pg\inc\pg_listener.h">
+      <Filter>pg</Filter>
+    </ClInclude>
+    <ClInclude Include="..\pg\inc\pg_log.h">
+      <Filter>pg</Filter>
+    </ClInclude>
+    <ClInclude Include="..\pg\inc\pg_msg.h">
+      <Filter>pg</Filter>
+    </ClInclude>
+    <ClInclude Include="..\pg\inc\pg_object.h">
+      <Filter>pg</Filter>
+    </ClInclude>
+    <ClInclude Include="..\pg\inc\pg_timer.h">
+      <Filter>pg</Filter>
+    </ClInclude>
+    <ClInclude Include="..\pg\inc\pg_util.h">
+      <Filter>pg</Filter>
+    </ClInclude>
+    <ClInclude Include="inc\ping.h">
+      <Filter>pg</Filter>
+    </ClInclude>
+    <ClInclude Include="inc\utility.h">
+      <Filter>ice</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="pg">
+      <UniqueIdentifier>{7fab1c94-2406-4d31-8db5-360ca940a4fc}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="ice">
+      <UniqueIdentifier>{ddccdf95-9af3-4643-b93a-d710e8b9cd82}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

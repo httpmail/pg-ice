@@ -41,7 +41,7 @@ namespace {
 
                     uint64_t priority = ((uint64_t)1 << 32) * std::min(G, D) + 2 * std::max(G, D) + (G > D ? 1 : 0);
 
-                    Session::CandidatePeer peer(priority, lcand, rcand);
+                    CandidatePeer peer(priority, *lcand, *rcand);
 
                     bool bAddPeer(true);
                     for (auto peer_itor = candPeers.begin(); peer_itor != candPeers.end(); ++peer_itor)
@@ -54,8 +54,8 @@ namespace {
                          */
                         auto peer_lcand = peer_itor->LCandidate();
                         auto peer_rcand = peer_itor->RCandidate();
-                        if ((lcand->m_BaseIP == peer_lcand->m_BaseIP && lcand->m_BasePort == peer_lcand->m_BasePort) &&
-                            (rcand->m_ConnIP == peer_rcand->m_ConnIP && rcand->m_ConnPort == peer_rcand->m_ConnPort))
+                        if ((lcand->m_BaseIP == peer_lcand.m_BaseIP && lcand->m_BasePort == peer_lcand.m_BasePort) &&
+                            (rcand->m_ConnIP == peer_rcand.m_ConnIP && rcand->m_ConnPort == peer_rcand.m_ConnPort))
                         {
                             bAddPeer = false;
                             break;
@@ -173,7 +173,7 @@ namespace ICE {
                     LOG_ERROR("Session", "[%s] media has no candidate peers", lmedia_itor->first.c_str());
                     return false;
                 }
-                else if (!m_CheckList.insert(std::make_pair(StreamInfo(lstream, lmedia->IcePwd(), lmedia->IceUfrag()), candPeerContainer.get())).second)
+                else if (!m_CheckList.insert(std::make_pair(StreamInfo(lstream,lmedia->IcePwd(), rmedia->IcePassword(),lmedia->IceUfrag(),rmedia->IceUfrag()), candPeerContainer.get())).second)
                 {
                     LOG_ERROR("Session", "[%s] media cannot create Check List", lmedia_itor->first.c_str());
                     return false;
@@ -185,12 +185,12 @@ namespace ICE {
                     auto rcand = itor->RCandidate();
                     auto lcand = itor->LCandidate();
                     LOG_ERROR("Session","lcand: [%d] => [%s:%d], [%s:%d] \n rcand: [%d] => [%s:%d], [%s:%d]",
-                        lcand->m_CandType,
-                        lcand->m_BaseIP.c_str(), lcand->m_BasePort,
-                        lcand->m_ConnIP.c_str(), lcand->m_ConnPort,
-                        rcand->m_CandType,
-                        rcand->m_BaseIP.c_str(), rcand->m_BasePort,
-                        rcand->m_ConnIP.c_str(), rcand->m_ConnPort);
+                        lcand.m_CandType,
+                        lcand.m_BaseIP.c_str(), lcand.m_BasePort,
+                        lcand.m_ConnIP.c_str(), lcand.m_ConnPort,
+                        rcand.m_CandType,
+                        rcand.m_BaseIP.c_str(), rcand.m_BasePort,
+                        rcand.m_ConnIP.c_str(), rcand.m_ConnPort);
                 }
                 candPeerContainer.release();
             }
@@ -215,10 +215,9 @@ namespace ICE {
             {
                 auto lcand = cand_peer_itor->LCandidate();
                 auto rcand = cand_peer_itor->RCandidate();
-                assert(lcand && rcand);
-                
-                if (!stream->ConnectivityCheck(lcand, rcand, m_Config.TieBreaker(), m_Config.IsControlling(),
-                    check_itor->first.m_Key, check_itor->first.m_Username))
+
+                if (!stream->ConnectivityCheck(&lcand, &rcand, m_Config.TieBreaker(), m_Config.IsControlling(),
+                    check_itor->first.m_LPwd, check_itor->first.m_RPwd, check_itor->first.m_LUfrag, check_itor->first.m_RUfrag))
                     continue;
                 std::this_thread::sleep_for(std::chrono::milliseconds(config.Ta()));
             }
@@ -234,17 +233,5 @@ namespace ICE {
     bool Session::MakeAnswer(const std::string & remoteOffer, std::string & answer)
     {
         return true;
-    }
-
-    Session::CandidatePeer::CandidatePeer(uint64_t PRI, const ICE::Candidate * lcand, const ICE::Candidate * rcand) :
-        m_PRI(PRI), m_LCand(lcand),m_RCand(rcand)
-    {
-        assert(lcand && rcand);
-        assert((lcand->m_Protocol == rcand->m_Protocol && lcand->m_Protocol == Protocol::udp) ||
-            (lcand->m_Protocol != rcand->m_Protocol && lcand->m_Protocol != Protocol::udp && rcand->m_Protocol != Protocol::udp));
-    }
-
-    Session::CandidatePeer::~CandidatePeer()
-    {
     }
 }

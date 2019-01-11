@@ -6,6 +6,7 @@
 namespace ICE {
 
     class CAgentConfig;
+    class Stream;
 
     class Media{
     public:
