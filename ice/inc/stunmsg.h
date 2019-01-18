@@ -70,7 +70,9 @@ namespace STUN {
         }
 
         virtual void Finalize() = 0 {}
+
         bool SendData(ICE::Channel& channel);
+        bool SendData(ICE::Channel& channel, const std::string& dest, uint16_t port);
 
         const ATTR::MappedAddress*    GetAttribute(const ATTR::MappedAddress*& mapAddr) const;
         const ATTR::XorMappedAddr*    GetAttribute(const ATTR::XorMappedAddr *& mapAddr) const;
@@ -167,14 +169,13 @@ namespace STUN {
         virtual void Finalize() override;
 
     private:
-        std::string m_Username;
         std::string m_IcePwd;
     };
 
-    class SubBindResqMsg : public MessagePacket {
+    class SubBindRespMsg : public MessagePacket {
     public:
-        SubBindResqMsg(const TransId& transId, const ATTR::XorMappedAddress& xormapAddr);
-        SubBindResqMsg(const PACKET::stun_packet& packet, uint16_t packet_size);
+        SubBindRespMsg(const TransId& transId, const ATTR::XorMappedAddress& xormapAddr);
+        SubBindRespMsg(const PACKET::stun_packet& packet, uint16_t packet_size);
         virtual void Finalize() {}
     };
 

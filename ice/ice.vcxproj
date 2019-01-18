@@ -161,6 +161,7 @@
     <ClInclude Include="inc\agent.h" />
     <ClInclude Include="inc\candidate.h" />
     <ClInclude Include="inc\channel.h" />
+    <ClInclude Include="inc\config.h" />
     <ClInclude Include="inc\icmp_header.h" />
     <ClInclude Include="inc\ipv4_header.h" />
     <ClInclude Include="inc\media.h" />
@@ -182,6 +183,7 @@
     <ClCompile Include="..\pg\src\pg_object.cpp" />
     <ClCompile Include="..\pg\src\pg_timer.cpp" />
     <ClCompile Include="..\pg\src\pg_util.cpp" />
+    <ClCompile Include="inc\config.cpp" />
     <ClCompile Include="src\agent.cpp" />
     <ClCompile Include="src\candidate.cpp" />
     <ClCompile Include="src\channel.cpp" />

@@ -4,771 +4,10 @@
 #include "agent.h"
 #include "channel.h"
 #include "pg_log.h"
+#include "config.h"
 #include <boost/lexical_cast.hpp>
 
 namespace ICE {
-    static const Stream::TimeOutInterval sTimeout = { 500, 1000,2000,4000,8000,16000, 8000 };
-
-    //////////////////////////////  class StunCheckHelper //////////////////////////////
-    class Stream::StunCheckHelper : public PG::Publisher {
-    public:
-        enum class Msg : uint16_t {
-            Checking, /* WPARAM @true - connectivity check ok, otherwise failed. if 'ok' next step is to Nominate*/
-            Nominate,
-        };
-
-    protected:
-        enum class Status {
-            waiting,
-            failed,
-            succeed,
-            quit,
-        };
-    private:
-        enum class State {
-            wait_checking,
-            wait_nominated,
-        };
-    public:
-        StunCheckHelper(Stream &Owner, const Candidate* lcand, const Candidate* rcand, STUN::SubBindReqMsg *pReqMsg, const Stream::TimeOutInterval& timer,
-            const std::string& lpwd, const std::string& rpwd,
-            const std::string& lufrag, const std::string& rufrag) :
-            m_Owner(Owner), m_LocalCand(lcand), m_RemoteCand(rcand), m_pSubBindReqMsg(pReqMsg), m_State(State::wait_checking), m_Status(Status::waiting), m_Timer(timer),
-            m_LPwd(lpwd),m_RPwd(rpwd), m_LUfrag(lufrag),m_RUfrag(rufrag)
-        {
-            assert(pReqMsg);
-            assert(lcand && rcand);
-            RegisterMsg(static_cast<uint16_t>(Msg::Checking));
-            RegisterMsg(static_cast<uint16_t>(Msg::Nominate));
-        }
-
-        ~StunCheckHelper()
-        {
-            if (m_RecvThrd.joinable())
-                m_RecvThrd.join();
-
-            if (m_SendThrd.joinable())
-                m_SendThrd.join();
-
-            delete m_pSubBindReqMsg;
-            m_pSubBindReqMsg = nullptr;
-        }
-
-        bool StartCheck()
-        {
-            assert(!m_RecvThrd.joinable() && !m_SendThrd.joinable());
-            assert(m_LocalCand && m_RemoteCand);
-            m_RecvThrd = std::thread(StunCheckHelper::RecvThread, this);
-            m_SendThrd = std::thread(StunCheckHelper::SendThread, this);
-            return true;
-        }
-
-    private:
-        void OnStunMsg(const STUN::SubBindErrRespMsg &errRespMsg)
-        {
-            using namespace STUN;
-            const ATTR::ErrorCode *pErrCode(nullptr);
-            const ATTR::MessageIntegrity *pMsgIntegrity(nullptr);
-
-            if (!errRespMsg.GetAttribute(pMsgIntegrity) || !MessagePacket::VerifyMsgIntegrity(errRespMsg, m_LPwd))
-            {
-                /*
-                RFC5389[10.2.3.  Receiving a Response]
-                The client looks for the MESSAGE-INTEGRITY attribute in the response
-                (either success or failure).  If present, the client computes the
-                message integrity over the response as defined in Section 15.4, using
-                the same password it utilized for the request.  If the resulting
-                value matches the contents of the MESSAGE-INTEGRITY attribute, the
-                response is considered authenticated.  If the value does not match,
-                or if MESSAGE-INTEGRITY was absent, the response MUST be discarded,
-                as if it was never received.  This means that retransmits, if
-                applicable, will continue.
-                 */
-                LOG_WARNING("Stream", "SubErrRespMsg cannot be authenticated, just discard this msg");
-            }
-            else if (!errRespMsg.GetAttribute(pErrCode))
-            {
-                /*
-                there is no error code, invalid error resp message, set the status to failed
-                */
-                std::lock_guard<decltype(m_StatusMutex)> locker(m_StatusMutex);
-                m_Status = Status::failed;
-                m_StatusCond.notify_one();
-            }
-            else if (pErrCode->Number() >= 300 && pErrCode->Number() <= 399)
-            {
-                /*
-                RFC5389 [7.3.3.  Processing a Success Response]
-                If the error code is 300 through 399, the client SHOULD consider
-                the transaction as failed unless the ALTERNATE-SERVER extension is
-                being used.  See Section 11.
-                */
-                std::lock_guard<decltype(m_StatusMutex)> locker(m_StatusMutex);
-                m_Status = Status::failed;
-                m_StatusCond.notify_one();
-            }
-            else if (pErrCode->Number() >= 400 && pErrCode->Number() <= 499)
-            {
-                /*
-                o  If the error code is 400 through 499, the client declares the
-                transaction failed; in the case of 420 (Unknown Attribute), the
-                response should contain a UNKNOWN-ATTRIBUTES attribute that gives
-                additional information.
-                */
-                LOG_ERROR("Stream", "Response Error code [%d], set status as failed", pErrCode->Number());
-                std::lock_guard<decltype(m_StatusMutex)> locker(m_StatusMutex);
-                m_Status = Status::failed;
-                m_StatusCond.notify_one();
-            }
-            else if (pErrCode->Number() >= 500 && pErrCode->Number() <= 599)
-            {
-                /*
-                o  If the error code is 500 through 599, the client MAY resend the
-                request; clients that do so MUST limit the number of times they do
-                this.
-                */
-            }
-            else if (pErrCode->Number() == 487)
-            {
-                /*
-                RFC8445 [7.2.5.1.  Role Conflict]
-                */
-            }
-        }
-
-        void OnStunMsg(const STUN::SubBindReqMsg &reqMsg)
-        {
-            using namespace STUN;
-
-            const ATTR::MessageIntegrity *pMsgIntegrity(nullptr);
-            const ATTR::UserName *pUsername(nullptr);
-            const ATTR::Role *pRole(nullptr);
-            const ATTR::Priority *pPriority(nullptr);
-            const ATTR::UseCandidate *pUseCandAttr(nullptr);
-
-            /*
-            RFC8445 [7.1.  STUN Extensions]
-            */
-            if (!reqMsg.GetAttribute(pRole) && !reqMsg.GetAttribute(pPriority))
-            {
-                LOG_WARNING("Stream", "bind request has no role or priority attribute, just discards");
-                return;
-            }
-
-            assert(pRole);
-
-            reqMsg.GetAttribute(pUseCandAttr);
-            if (pRole->Type() == ATTR::Id::IceControlled && pUseCandAttr)
-            {
-                /*
-                RFC8445[7.1.2.  USE-CANDIDATE]
-
-                The controlling agent MUST include the USE-CANDIDATE attribute in
-                order to nominate a candidate pair (Section 8.1.1).  The controlled
-                agent MUST NOT include the USE-CANDIDATE attribute in a Binding
-                request.
-                 */
-                LOG_WARNING("Stream", "The controlled agent MUST NOT include the USE - CANDIDATE attribute in a Binding request");
-                return;
-            }
-            /*
-            RFC5389 10.2.2. Receiving a Request
-            */
-            reqMsg.GetAttribute(pMsgIntegrity);
-            reqMsg.GetAttribute(pUsername);
-            if (!pMsgIntegrity && !pUsername )
-            {
-                // 400 bad request
-                SubBindErrRespMsg errRespMsg(m_pSubBindReqMsg->TransationId(), 4, 0, "bad-request");
-                errRespMsg.SendData(*m_Channel);
-            }
-            else if (pUsername && (m_LUfrag + ":" + m_RUfrag) != pUsername->Name())
-            {
-                // 401 Unauthorized
-                SubBindErrRespMsg errRespMsg(m_pSubBindReqMsg->TransationId(), 4, 1, "unmatched-username");
-                errRespMsg.SendData(*m_Channel);
-            }
-            else if (!MessagePacket::VerifyMsgIntegrity(reqMsg, m_LPwd))
-            {
-                // 401 Unauthorized
-                SubBindErrRespMsg errRespMsg(m_pSubBindReqMsg->TransationId(), 4, 1, "unmatched-MsgIntegrity");
-                errRespMsg.SendData(*m_Channel);
-            }
-            else if (reqMsg.GetUnkonwnAttrs().size())
-            {
-                SubBindErrRespMsg errRespMsg(m_pSubBindReqMsg->TransationId(), 4, 20, "Unknown-Attribute");
-                errRespMsg.AddUnknownAttributes(reqMsg.GetUnkonwnAttrs());
-                errRespMsg.SendData(*m_Channel);
-            }
-            else if (m_bControlling == (pRole->Type() == ATTR::Id::IceControlling))
-            {
-                // RFC8445 [7.3.1.1.  Detecting and Repairing Role Conflicts]
-                if ((m_bControlling && m_TieBreaker >= pRole->TieBreaker()) ||
-                    (!m_bControlling && m_TieBreaker < pRole->TieBreaker()))
-                {
-                    SubBindErrRespMsg errRespMsg(m_pSubBindReqMsg->TransationId(), 4, 87, "Role-Conflict");
-                    errRespMsg.SendData(*m_Channel);
-                }
-                else
-                {
-                    //TODO switch role
-                }
-            }
-            else
-            {
-                // now we can send success response message
-                ATTR::XorMappedAddress xorMapAddr;
-                xorMapAddr.Port(m_Channel->PeerPort());
-                assert(boost::asio::ip::address::from_string(m_Channel->PeerIP()).is_v4());
-                xorMapAddr.Address(boost::asio::ip::address::from_string(m_Channel->PeerIP()).to_v4().to_uint());
-
-                SubBindResqMsg respMsg(m_pSubBindReqMsg->TransationId(), xorMapAddr);
-                respMsg.SendData(*m_Channel);
-            }
-        }
-
-        void OnStunMsg(const STUN::SubBindResqMsg &respMsg)
-        {
-            using namespace STUN;
-            const ATTR::MessageIntegrity *pMsgIntegrity(nullptr);
-            if (!respMsg.GetAttribute(pMsgIntegrity) || !MessagePacket::VerifyMsgIntegrity(respMsg, m_LPwd))
-            {
-                /*
-                RFC5389 [10.1.3.  Receiving a Response]
-                If the value does not match, or if
-                MESSAGE-INTEGRITY was absent, the response MUST be discarded, as if
-                it was never received
-                */
-            }
-            else if (respMsg.GetUnkonwnAttrs().size())
-            {
-                /*
-                RFC5389 [7.3.3.  Processing a Success Response]
-                If the success response contains unknown comprehension-required
-                attributes, the response is discarded and the transaction is
-                considered to have failed.
-                */
-                std::lock_guard<decltype(m_StatusMutex)> locker(m_StatusMutex);
-                m_Status = Status::failed;
-                m_StatusCond.notify_one();
-            }
-
-            const ATTR::XorMappedAddress *pXorMapAddr(nullptr);
-            if (respMsg.GetAttribute(pXorMapAddr))
-            {
-                /*
-                RFC5245 [7.1.3.1.  Failure Cases]
-                The agent MUST check that the source IP address and port of the
-                response equal the destination IP address and port to which the
-                Binding request was sent, and that the destination IP address and
-                port of the response match the source IP address and port from which
-                the Binding request was sent.  In other words, the source and
-                destination transport addresses in the request and responses are
-                symmetric.  If they are not symmetric, the agent sets the state of
-                the pair to Failed.
-                */
-                if (pXorMapAddr->IP() == m_LocalCand->m_BaseIP && pXorMapAddr->Port() == m_LocalCand->m_BasePort)
-                {
-                    LOG_INFO("Stream", "valid resp msg L<=>R [%s:%d] <=>[%s:%d]",
-                        m_Channel->IP().c_str(), m_Channel->Port(),
-                        m_Channel->PeerIP().c_str(), m_Channel->PeerPort());
-                    std::lock_guard<decltype(m_StatusMutex)> locker(m_StatusMutex);
-                    m_Status = Status::succeed;
-                    m_StatusCond.notify_one();
-                }
-                else
-                {
-                    LOG_ERROR("Stream", "SubRespMsg unsymmetric address");
-                    std::lock_guard<decltype(m_StatusMutex)> locker(m_StatusMutex);
-                    m_Status = Status::failed;
-                    m_StatusCond.notify_one();
-                }
-            }
-            else
-            {
-                std::lock_guard<decltype(m_StatusMutex)> locker(m_StatusMutex);
-                m_Status = Status::failed;
-                m_StatusCond.notify_one();
-            }
-        }
-
-    private:
-        static void RecvThread(StunCheckHelper *pThis)
-        {
-            using namespace STUN;
-            do
-            {
-                STUN::PACKET::stun_packet packet;
-                auto bytes = pThis->m_Channel->Read(&packet, sizeof(packet));
-                if (bytes && MessagePacket::IsValidStunPacket(packet, bytes))
-                {
-                    switch (packet.MsgId())
-                    {
-                    case STUN::MsgType::BindingResp:
-                        pThis->OnStunMsg(SubBindResqMsg(packet, bytes));
-                        break;
-
-                    case STUN::MsgType::BindingErrResp:
-                        pThis->OnStunMsg(SubBindErrRespMsg(packet, bytes));
-                        break;
-
-                    case STUN::MsgType::BindingRequest:
-                        pThis->OnStunMsg(SubBindReqMsg(packet, bytes));
-                        break;
-                    default:
-                        break;
-                    }
-                }
-                std::lock_guard<decltype(pThis->m_StatusMutex)> locker(pThis->m_StatusMutex);
-            } while (pThis->m_Status != Status::waiting);
-
-        }
-        static void SendThread(StunCheckHelper *pThis)
-        {
-            assert(pThis && pThis->m_pSubBindReqMsg);
-
-            for (auto timer_itor = pThis->m_Timer.begin(); timer_itor != pThis->m_Timer.end(); ++timer_itor)
-            {
-                if (!pThis->m_pSubBindReqMsg->SendData(*pThis->m_Channel))
-                {
-                    LOG_ERROR("Stream", "Connectivity Check send Requst Failed");
-                    continue;
-                }
-
-                std::unique_lock<decltype(pThis->m_StatusMutex)> locker(pThis->m_StatusMutex);
-                auto ret = pThis->m_StatusCond.wait_for(locker, std::chrono::milliseconds(*timer_itor), [pThis]() {
-                    return pThis->m_Status != Status::waiting;
-                });
-
-                if (ret)
-                {
-                    LOG_WARNING("Stream", "[%s:%d] => [%s:%d] completed, status [%s]",
-                        pThis->m_LocalCand->m_BaseIP.c_str(), pThis->m_LocalCand->m_BasePort,
-                        pThis->m_RemoteCand->m_ConnIP.c_str(), pThis->m_RemoteCand->m_ConnPort,
-                        (pThis->m_Status == Status::succeed ? "OK" : "Failed"));
-
-                    pThis->Publish(static_cast<PG::MsgEntity::MSG_ID>(Msg::Checking), (PG::MsgEntity::LPARAM)(pThis->m_Status == Status::succeed), nullptr);
-                    return;
-                }
-
-                LOG_WARNING("Stream", "connectivity check timeout retry [%s:%d] =>[%s:%d]",
-                    pThis->m_LocalCand->m_BaseIP.c_str(), pThis->m_LocalCand->m_BasePort,
-                    pThis->m_RemoteCand->m_ConnIP.c_str(), pThis->m_RemoteCand->m_ConnPort);
-            }
-            pThis->Publish(static_cast<PG::MsgEntity::MSG_ID>(Msg::Checking), false, nullptr);
-        }
-
-    private:
-        std::thread              m_RecvThrd;
-        std::thread              m_SendThrd;
-        bool                     m_bControlling;
-        uint64_t                 m_TieBreaker;
-        const Candidate         *m_LocalCand;
-        const Candidate         *m_RemoteCand;
-        Stream                  &m_Owner;
-        Channel                 *m_Channel;
-        STUN::SubBindReqMsg     *m_pSubBindReqMsg;
-        const std::string       &m_LPwd;
-        const std::string       &m_RPwd;
-        const std::string       &m_LUfrag;
-        const std::string       &m_RUfrag;
-        const Stream::TimeOutInterval&  m_Timer;
-
-        State                    m_State;
-        std::mutex               m_StateMutex;
-        std::condition_variable  m_StateCond;
-
-        Status                   m_Status;
-        std::mutex               m_StatusMutex;
-        std::condition_variable  m_StatusCond;
-    };
-
-    ////////////////////////////// Stream //////////////////////////////
-    Stream::Stream(uint16_t compId, Protocol protocol, uint16_t localPref, const std::string & hostIp, uint16_t hostPort) :
-        m_CompId(compId), m_Protocol(protocol), m_LocalPref(localPref), m_HostIP(hostIp), m_HostPort(hostPort), m_Quit(false),
-        m_GatherEventSub(this), m_PendingGatherCnt(0)
-    {
-        assert(hostPort);
-        RegisterEvent(static_cast<PG::MsgEntity::MSG_ID>(Message::Gathering));
-        RegisterEvent(static_cast<PG::MsgEntity::MSG_ID>(Message::Checking));
-    }
-
-    Stream::~Stream()
-    {
-        if (m_GatherThrd.joinable())
-            m_GatherThrd.join();
-    }
-
-    bool Stream::Create(const CAgentConfig& config)
-    {
-        return false;
-    }
-
-    bool Stream::GatheringCandidate(const CAgentConfig& config)
-    {
-        // step 1> gather host candidate
-        if (!GatherHostCandidate(m_HostIP, m_HostPort, m_Protocol))
-        {
-            LOG_ERROR("Stream", "Gather Host Candidate Failed");
-            return false;
-        }
-
-        auto &stun_server   = config.StunServer();
-        auto &port_range    = config.GetPortRange();
-
-        for (auto itor = stun_server.begin(); itor != stun_server.end(); ++itor)
-        {
-            GatherReflexiveCandidate(config.DefaultIP(), port_range.Lower(), port_range.Upper(), itor->first, itor->second);
-            std::unique_lock<decltype(m_TaMutex)> locker(m_TaMutex);
-            m_TaCond.wait_for(locker, std::chrono::milliseconds(config.Ta()));
-        }
-
-        auto &turn_server = config.TurnServer();
-        for (auto itor = turn_server.begin(); itor != turn_server.end(); ++itor)
-        {
-            GatherRelayedCandidate(config.DefaultIP(), port_range.Lower(), port_range.Upper(), itor->first, itor->second);
-            std::unique_lock<decltype(m_TaMutex)> locker(m_TaMutex);
-            m_TaCond.wait_for(locker, std::chrono::milliseconds(config.Ta()));
-        }
-
-        if(!m_GatherThrd.joinable())
-            m_GatherThrd = std::thread(Stream::WaitGatheringDoneThread, this);
-
-        return true;
-    }
-
-    bool Stream::ConnectivityCheck(const Candidate * lcand, const Candidate * rcand, uint64_t tieBreaker, bool bControlling,
-        const std::string& lpwd, const std::string& rpwd,
-        const std::string& lufrag, const std::string& rufrag)
-    {
-        assert(lcand && rcand && m_Cands.find(const_cast<Candidate*>(lcand)) != m_Cands.end());
-
-        auto lcand_itor = m_Cands.find(const_cast<Candidate*>(lcand));
-
-        STUN::TransId id;
-        STUN::MessagePacket::GenerateRFC5389TransationId(id);
-
-        std::auto_ptr<STUN::SubBindReqMsg> bindReqMsg(new STUN::SubBindReqMsg(lcand->m_Priority, id, bControlling, tieBreaker, rufrag + ":" + lufrag, rpwd));
-        std::auto_ptr<StunCheckHelper> checker( new StunCheckHelper(*this, lcand, rcand, bindReqMsg.get(), sTimeout,lpwd, rpwd, lufrag, rufrag));
-
-        if (!checker.get() || !checker->StartCheck())
-        {
-            LOG_ERROR("Stream", "Cannot Start to connectivity check [%s:%d] =>[%s:%d]",
-                lcand->m_BaseIP.c_str(), lcand->m_BasePort, rcand->m_ConnIP.c_str(), rcand->m_ConnPort);
-            return false;
-        }
-
-
-        std::lock_guard<decltype(m_PendingCheckersMutex)> locker(m_PendingCheckersMutex);
-        if (!m_PendingCheckers.insert(std::make_pair(checker.get(), peer(lcand, rcand))).second)
-        {
-            LOG_ERROR("Stream", "Cannot create pending checker [%s:%d] =>[%s:%d]",
-            lcand->m_BaseIP.c_str(), lcand->m_BasePort, rcand->m_ConnIP.c_str(), rcand->m_ConnPort);
-            return false;
-        }
-
-        checker.release();
-        bindReqMsg.release();
-        return true;
-    }
-
-    Channel * Stream::CreateChannel(Protocol protocol)
-    {
-        return nullptr;
-    }
-
-    bool Stream::GatherHostCandidate(const std::string & ip, uint16_t port, Protocol protocol)
-    {
-        std::auto_ptr<Channel> channel(nullptr);
-        switch (protocol)
-        {
-        case Protocol::udp:
-            channel.reset(CreateChannel<UDPChannel>(ip, port));
-            break;
-
-        case Protocol::tcp_pass:
-            channel.reset(CreateChannel<TCPPassiveChannel>(ip, port));
-            break;
-
-        case Protocol::tcp_act:
-            channel.reset(CreateChannel<TCPActiveChannel>(ip, port));
-            break;
-
-        default:
-            break;
-        }
-
-        if (!channel.get())
-            return false;
-
-        auto foundation = Candidate::ComputeFoundations(Candidate::CandType::host, ip, ip, protocol);
-        auto priority   = Candidate::ComputePriority(Candidate::CandType::host, m_LocalPref, m_CompId);
-        std::auto_ptr<HostCand> cand(new HostCand(priority,foundation, ip, port));
-
-        if(!cand.get())
-            return false;
-        {
-            std::lock_guard<decltype(m_CandsMutex)> locker(m_CandsMutex);
-            if (m_Cands.insert(std::make_pair(cand.get(), channel.get())).second)
-            {
-                cand.release();
-                channel.release();
-                LOG_INFO("Stream", "Host Candidate Created : [%s:%d]", ip.c_str(), port);
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    bool Stream::GatherReflexiveCandidate(const std::string & ip, uint16_t lowerPort, uint16_t upperPort, const std::string & stunIP, uint16_t stunPort)
-    {
-        std::auto_ptr<UDPChannel> channel(CreateChannel<UDPChannel>(ip, lowerPort, upperPort, m_MaxTries));
-
-        if (!channel.get() || !channel->BindRemote(stunIP, stunPort))
-        {
-            LOG_ERROR("Stream", "Create Channel Failed while tried to gather reflexive candidate from [%s]", stunIP.c_str());
-            return false;
-        }
-
-        using namespace STUN;
-
-        // build 1st bind request message
-        TransId id;
-        MessagePacket::GenerateRFC5389TransationId(id);
-        FirstBindReqMsg *pMsg = new FirstBindReqMsg(id);
-
-        std::auto_ptr<StunGatherHelper> helper(new StunGatherHelper(channel.get(), stunIP, stunPort, pMsg, sTimeout));
-        {
-            std::lock_guard<decltype(m_GatherMutex)> locker(m_GatherMutex);
-            if (!helper.get() || !m_StunPendingGather.insert(helper.get()).second)
-            {
-                LOG_ERROR("Stream", "Start Gathering Failed [stun: %s, local: %s:%d]", stunIP.c_str(), channel->IP().c_str(), channel->Port());
-                return false;
-            }
-            m_PendingGatherCnt++;
-        }
-
-        helper->Subscribe(&m_GatherEventSub, static_cast<uint16_t>(StunGatherHelper::PubEvent::GatheringEvent));
-        helper->StartGathering();
-        helper.release();
-        channel.release();
-        return true;
-    }
-
-
-
-    bool Stream::GatherRelayedCandidate(const std::string & ip, uint16_t lowerPort, uint16_t upperPort, const std::string & turnServer, uint16_t turnPort)
-    {
-        return true;
-    }
-
-    void Stream::WaitGatheringDoneThread(Stream * pThis)
-    {
-        assert(pThis);
-
-        std::unique_lock<decltype(pThis->m_WaitingGatherMutex)> locker(pThis->m_WaitingGatherMutex);
-
-        pThis->m_WaitingGatherCond.wait(locker, [pThis] {
-            return pThis->m_PendingGatherCnt <= 0;
-        });
-
-        for (auto itor = pThis->m_StunPendingGather.begin(); itor != pThis->m_StunPendingGather.end(); ++itor)
-        {
-            auto helper = *itor;
-            if (helper->IsOK())
-            {
-                auto foundation = Candidate::ComputeFoundations(Candidate::CandType::svr_ref, helper->m_ConnIP, helper->m_StunIP, Protocol::udp);
-                auto priority = Candidate::ComputePriority(Candidate::CandType::svr_ref, pThis->m_LocalPref, pThis->m_CompId);
-
-                std::auto_ptr<SvrCand> cand(new SvrCand(priority,
-                    foundation, helper->m_ConnIP,
-                    helper->m_ConnPort,
-                    helper->m_Channel->IP(),
-                    helper->m_Channel->Port()));
-
-                if (cand.get())
-                {
-                    std::lock_guard<decltype(pThis->m_CandsMutex)> locker(pThis->m_CandsMutex);
-                    if (pThis->m_Cands.insert(std::make_pair(cand.get(), helper->m_Channel)).second)
-                    {
-                        LOG_INFO("Stream", "SrflxCandidate Created, [%s:%d]", helper->m_Channel->IP().c_str(), helper->m_Channel->Port());
-                        cand.release();
-                    }
-                }
-            }
-            (*itor)->Unsubscribe(&pThis->m_GatherEventSub);
-        }
-        pThis->m_StunPendingGather.clear();
-        pThis->NotifyListener(static_cast<uint16_t>(Message::Gathering), (WPARAM)pThis, (LPARAM)(pThis->m_Cands.size() > 0));
-    }
-
-    void Stream::ConnectivityRecvThread(Stream * pThis, Channel * channel)
-    {
-        assert(pThis && channel);
-        while (1)
-        {
-        }
-    }
-
-    ////////////////////////////// GatherHelper class //////////////////////////////
-    Stream::StunGatherHelper::StunGatherHelper(Channel * channel, const std::string& stunServer, uint16_t stunPort, STUN::FirstBindReqMsg *pMsg, const TimeOutInterval & timeout) :
-        m_Channel(channel), m_pBindReqMsg(pMsg), m_Timeout(timeout), m_Status(Status::waiting),m_StunIP(stunServer),m_StunPort(stunPort)
-    {
-        assert(timeout.size());
-        assert(channel);
-        assert(pMsg);
-        RegisterMsg(static_cast<uint16_t>(PubEvent::GatheringEvent));
-    }
-
-    Stream::StunGatherHelper::~StunGatherHelper()
-    {
-        {
-            std::lock_guard<decltype(m_Mutex)> locker(m_Mutex);
-            m_Status = Status::quit;
-        }
-
-        m_Channel->Close();
-
-        if (m_RecvThread.joinable())
-            m_RecvThread.join();
-
-        if (m_GatherThread.joinable())
-            m_GatherThread.join();
-
-        delete m_pBindReqMsg;
-    }
-
-    void Stream::StunGatherHelper::StartGathering()
-    {
-        assert(!m_GatherThread.joinable() && !m_RecvThread.joinable());
-        m_GatherThread = std::thread(StunGatherHelper::GatheringThread, this);
-        m_RecvThread   = std::thread(StunGatherHelper::ReceiveThread, this);
-    }
-
-    bool Stream::StunGatherHelper::OnStunMsg(const STUN::FirstBindRespMsg & msg)
-    {
-        LOG_INFO("Stream", "1st Bind Request Received Success Response");
-
-        const STUN::ATTR::XorMappedAddr *pXormapAddr = nullptr;
-        if (msg.GetAttribute(pXormapAddr))
-        {
-            {
-                std::lock_guard<decltype(m_Mutex)> locker(m_Mutex);
-                m_ConnIP = pXormapAddr->IP();
-                m_ConnPort = pXormapAddr->Port();
-                m_Status = Status::succeed;
-            }
-            m_Cond.notify_one();
-            return true;
-        }
-        else
-        {
-            LOG_ERROR("Stream", "1st bind Request received RESPONSE without xormapaddress attributes ,just discards");
-            return false;
-        }
-    }
-
-    bool Stream::StunGatherHelper::OnStunMsg(const STUN::FirstBindErrRespMsg & msg)
-    {
-        LOG_WARNING("Stream", "1st Bind Request Received Error Response, Just set result to failed");
-        {
-            std::lock_guard<decltype(m_Mutex)> locker(m_Mutex);
-            m_Status = Status::failed;
-        }
-        m_Cond.notify_one();
-        return true;
-    }
-
-    void Stream::StunGatherHelper::ReceiveThread(StunGatherHelper * pThis)
-    {
-        assert(pThis && pThis->m_Channel);
-
-        using namespace STUN;
-
-        while(pThis->m_Status == Status::waiting)
-        {
-            STUN::PACKET::stun_packet packet;
-            auto bytes = pThis->m_Channel->Read(&packet, sizeof(packet));
-
-            if (bytes && MessagePacket::IsValidStunPacket(packet, bytes))
-            {
-                auto msg_id = packet.MsgId();
-                switch (msg_id)
-                {
-                case STUN::MsgType::BindingResp:
-                    pThis->OnStunMsg(FirstBindRespMsg(packet,bytes));
-                    break;
-
-                case STUN::MsgType::BindingErrResp:
-                    pThis->OnStunMsg(FirstBindErrRespMsg(packet,bytes));
-                    break;
-
-                default:
-                    break;
-                }
-            }
-        };
-    }
-
-    void Stream::StunGatherHelper::GatheringThread(StunGatherHelper * pThis)
-    {
-        assert(pThis && pThis->m_Channel);
-
-        for (auto itor = pThis->m_Timeout.begin(); itor != pThis->m_Timeout.end(); ++itor)
-        {
-            if (!pThis->m_pBindReqMsg->SendData(*pThis->m_Channel))
-            {
-                LOG_ERROR("Stream", "Cannot send 1st bind request");
-            }
-
-            std::unique_lock<decltype(pThis->m_Mutex)> locker(pThis->m_Mutex);
-            if (true == pThis->m_Cond.wait_for(locker, std::chrono::milliseconds(*itor), [pThis] {
-                return pThis->m_Status != Status::waiting; }))
-            {
-                LOG_INFO("Stream", "Gather Candidate from StunServer[%s], result :%d : [%s:%d]",
-                    pThis->m_StunIP.c_str(),
-                    pThis->m_Status,
-                    pThis->m_ConnIP.c_str(),pThis->m_ConnPort);
-                break;
-            }
-            LOG_WARNING("Stream", "send 1st to stun :%s timout, try again()", pThis->m_Channel->PeerIP().c_str());
-        }
-
-        pThis->m_Channel->Shutdown(Channel::ShutdownType::both);  // close channel to wakeup recv thread
-        pThis->Publish(static_cast<uint16_t>(PubEvent::GatheringEvent), (WPARAM)(pThis->m_Status == Status::succeed), 0);
-    }
-
-    Stream::GatherEventSubsciber::GatherEventSubsciber(Stream * pOwner) :
-        m_pOwner(pOwner)
-    {
-        assert(m_pOwner);
-    }
-
-    /////////////////////////// GatherEventSubsciber ////////////////////
-    void Stream::GatherEventSubsciber::OnPublished(const PG::Publisher * publisher, PG::MsgEntity::MSG_ID msgId, PG::MsgEntity::WPARAM wParam, PG::MsgEntity::LPARAM lParam)
-    {
-        assert(m_pOwner && publisher);
-        assert(static_cast<StunGatherHelper::PubEvent>(msgId) == StunGatherHelper::PubEvent::GatheringEvent);
-
-        {
-            std::lock_guard<decltype(m_pOwner->m_GatherMutex)> locker(m_pOwner->m_GatherMutex);
-            auto helper = dynamic_cast<const StunGatherHelper*>(publisher);
-            assert(helper);
-            assert(m_pOwner->m_StunPendingGather.find(const_cast<StunGatherHelper*>(helper)) != m_pOwner->m_StunPendingGather.end());
-            m_pOwner->m_PendingGatherCnt--;
-        }
-        m_pOwner->m_TaCond.notify_one();
-        if (m_pOwner->m_PendingGatherCnt <= 0)
-        {
-            LOG_INFO("Stream", "Gathering Stun Candidate Done");
-            m_pOwner->m_WaitingGatherCond.notify_one();
-        }
-    }
-
-}
-
-namespace STUN {
     /*
     RFC4389
     For example, assuming an RTO of 500 ms,
@@ -776,148 +15,350 @@ namespace STUN {
     ms, 15500 ms, and 31500 ms.  If the client has not received a
     response after 39500 ms
     */
-    const Stream::TimeOutInterval Stream::UDPTimeoutInterval = { 500, 1000,2000,4000,8000,16000, 8000 };
-    const Stream::TimeOutInterval Stream::TCPTimeoutInterval = { 39500 };
+    const Stream::TimeOutInterval Stream::sUDPTimeoutInterval = { 500, 1000,2000,4000,8000,16000, 8000 };
+    const Stream::TimeOutInterval Stream::sTCPTimeoutInterval = { 39500 };
+    const char* Stream::sTransportProtocol = "RTP/SAVP";
 
-    Stream::Stream(uint16_t comp_id, Protocol protocol) :
-        m_ComponentId(comp_id), m_LocalProtocol(protocol), m_GatherSubscriber(this), m_LocalAuthInfo("",""),m_RemoteAuthInfo("","")
+    ////////////////////// GatherSession class //////////////////////
+    class Stream::GatherSession : public PG::Publisher {
+    public:
+        enum class Message : uint16_t {
+            StatusChange
+        };
+
+    protected:
+        enum class Status : uint16_t {
+            waiting_resp = 0,
+            failed,
+            succeed,
+            quit,
+        };
+
+    public:
+        GatherSession(const Stream* pOwner, const Stream::TimeOutInterval& timeout, STUN::TransIdConstRef id, Channel& channel, const std::string& targetIP, uint16_t port);
+        virtual ~GatherSession();
+
+        GatherSession(const GatherSession& other) = delete;
+        GatherSession& operator=(const GatherSession& other) = delete;
+
+    public:
+        virtual bool Initilize();
+        Candidate*   GetCandidate() const { return m_pCandidate; }
+
+    protected:
+        void OnStart();
+
+    private:
+        void OnStunMessage(const STUN::FirstBindRespMsg     &respMsg);
+        void OnStunMessage(const STUN::FirstBindErrRespMsg  &errRespMsg);
+
+    private:
+        static void RecvThread(GatherSession *pThis);
+        static void SendThread(GatherSession *pThis);
+
+    protected:
+        STUN::FirstBindReqMsg   m_ReqMsg;
+        const TimeOutInterval  &m_timeout;
+        Channel                &m_Channel;
+
+        std::mutex              m_StatusMutex;
+        std::condition_variable m_StatusCond;
+        Status                  m_Status;
+        Candidate              *m_pCandidate;
+        const std::string       m_TargetIP;
+        const uint16_t          m_TargetPort;
+        const Stream*           m_pOwner;
+
+    private:
+        std::thread m_RecvThrd;
+        std::thread m_SendThrd;
+    };
+
+    ////////////////////// TCPGatherSession class //////////////////////
+    class Stream::TCPGatherSession : public Stream::GatherSession {
+    public:
+        using Stream::GatherSession::GatherSession;
+        ~TCPGatherSession();
+
+    public:
+        virtual bool Initilize() override;
+
+    private:
+        static void ConnectThread(TCPGatherSession* pThis);
+
+    private:
+        std::thread m_ConnectThrd;
+    };
+
+    ////////////////////// CheckSession class //////////////////////
+    class Stream::CheckSession : public PG::Publisher {
+    public:
+        enum class Message : uint16_t {
+            StatusChanged
+        };
+
+    public:
+        CheckSession(Stream& owner, Channel &channel, const TimeOutInterval& timer, const UTILITY::AuthInfo &lauthInfo, const UTILITY::AuthInfo &rauthInfo);
+        ~CheckSession();
+
+    public:
+        bool CreateChecker(const Candidate &lcand, const Candidate &rcand);
+        uint32_t CheckerNumber() const { return m_Checks.size(); }
+        uint64_t TieBreaker()    const { return m_Owner.m_TieBreaker;}
+        bool IsControlling()     const { return m_Owner.m_bControlling; }
+
+    public:
+        virtual bool Initilize() = 0;
+
+    protected:
+        void OnStart();
+        void OnStunMessage(const STUN::SubBindReqMsg &reqMsg);
+
+    private:
+        static void RecvThread(CheckSession *pThis);
+
+    private:
+        class Checker;
+        struct KeyCmp {
+            bool operator()(const uint64_t *key1, const uint64_t *key2) const
+            {
+                assert(key1 && key2);
+
+                if (key1 == key2)
+                    return false;
+
+                if (key1[0] == key2[0])
+                    return key1[1] < key2[1];
+
+                return key1[0] < key2[0];
+            }
+        };
+
+        using CheckerContainer = std::map <const uint64_t*, Checker*, KeyCmp>;
+
+    private:
+        void OnCheckerCompleted(Checker &chekcer, bool bSucceed);
+
+    protected:
+        Channel               &m_Channel;
+        const TimeOutInterval &m_Timer;
+        std::mutex             m_ChecksMutex;
+        CheckerContainer       m_Checks;
+        CheckerContainer       m_RemoteChecks;
+        CheckerContainer       m_SucceedChecks;
+        CheckerContainer       m_FailedChecks;
+
+    private:
+        Stream      &m_Owner;
+        std::thread  m_RecvThrd;
+
+    private:
+        const UTILITY::AuthInfo &m_LAuthInfo;
+        const UTILITY::AuthInfo &m_RAuthInfo;
+    };
+
+    /////////////////////////////////////// UDPCheckSession class ////////////////////////////////////////////////
+    class Stream::UDPCheckSession : public CheckSession {
+    public:
+        using Stream::CheckSession::CheckSession;
+
+    public:
+        bool Initilize() override { assert(m_Checks.size()); OnStart(); return true; }
+    };
+
+    /////////////////////////////////////// TCPCheckSession class ////////////////////////////////////////////////
+    class Stream::TCPCheckSession : public CheckSession {
+    public:
+        using Stream::CheckSession::CheckSession;
+
+    public:
+        bool Initilize() override;
+
+    private:
+        static void ConnectThread(TCPCheckSession *pThis);
+
+    private:
+        std::thread m_ConnThrd;
+    };
+
+    /////////////////////////////////////// Stream class ////////////////////////////////////////////////
+    Stream::Stream(uint16_t comp_id, Protocol protocol, const std::string& hostIP, uint16_t hostPort) :
+        m_ComponentId(comp_id), m_LocalProtocol(protocol),
+        m_GatherSubscriber(this), m_CheckSubscriber(*this),
+        m_DefIP(hostIP), m_DefPort(hostPort)
     {
+        assert(hostPort);
     }
 
     Stream::~Stream()
     {
     }
 
-    bool Stream::GatherCandidate(const std::string& localIP, uint16_t port,
-        uint16_t Ta, const UTILITY::PortRange& portRange,
-        const UTILITY::Servers& stunServer, const UTILITY::Servers& turnServer)
+    bool Stream::GatherCandidate()
     {
-
+        auto & config = Configuration::Instance();
+        /*
+          !!!! Notice !!!! 
+          in Gather Phase, just create UDPChannel or TCPChannel. DONOT create TCPPassiveChannel
+         */
         // gather host candidates
-        GatherHostCandidate(localIP, port);
+        GatherHostCandidate(m_DefIP, m_DefPort);
 
         // gather server reflex candidates
-        for (auto stun_itor = stunServer.begin(); stun_itor != stunServer.end(); ++stun_itor)
+        for (auto stun_itor = config.StunServer().begin(); stun_itor != config.StunServer().end(); ++stun_itor)
         {
-            if (!GatherSvrCandidate(localIP, portRange._min, portRange._max, stun_itor->_ip, stun_itor->_port))
+            if (!GatherSvrCandidate(m_DefIP, config.GetPortRange().Min(), config.GetPortRange().Max(), stun_itor->IP(), stun_itor->Port()))
                 continue;
 
             std::unique_lock<decltype(m_TaMutex)> locker(m_TaMutex);
-            m_TaCond.wait_for(locker, std::chrono::milliseconds(Ta));
+            m_TaCond.wait_for(locker, std::chrono::milliseconds(config.Ta()));
         }
 
-        std::unique_lock<decltype(m_SessionChannelMutex)> locker(m_SessionChannelMutex);
-        m_SessionChannelCond.wait(locker, [this]() {
-            return this->m_SessionCnt < 0;
+        std::unique_lock<decltype(m_GatherSessionMutex)> locker(m_GatherSessionMutex);
+        m_GatherSessionCond.wait(locker, [this]() {
+            return this->m_PendingGatherSessions.size() == 0;
         });
 
-        for (auto itor = m_SessionChannels.begin(); itor != m_SessionChannels.end(); ++itor)
+        for (auto itor = m_GatherSessions.begin(); itor != m_GatherSessions.end(); ++itor)
         {
-            assert(itor->first);
-            itor->first->Unsubscribe(&m_GatherSubscriber);
-            delete itor->first;
+            assert(itor->first && itor->second);
+
+
+            auto session   = itor->first;
+            auto candidate = session->GetCandidate();
+            std::auto_ptr<Channel> channel(itor->second);
+
+            if (candidate)
+            {
+                /*
+                * !!!! Notice !!!!
+                * reallocate corresponding channel, cause in gathering phase, only tcp channel
+                */
+                if (m_LocalProtocol != Protocol::udp)
+                {
+                    std::string ip = channel->IP();
+                    uint16_t port = channel->Port();
+                    channel->Close();
+                    channel.reset(CreateChannel(m_LocalProtocol, ip, port));
+                }
+
+                if (!channel.get() || !m_CandChannels.insert(std::make_pair(candidate, channel.get())).second)
+                {
+                    delete candidate;
+                    LOG_ERROR("Stream", "Gather failed to create channle [%s:%d]", channel->IP().c_str(), channel->Port());
+                }
+                else
+                {
+                    LOG_ERROR("Stream", "Gather succeed [%s:%d]", channel->IP().c_str(), channel->Port());
+                    channel.release();
+                }
+            }
+            else
+            {
+                channel->Close();
+            }
+
+            // release session
+            session->Unsubscribe(&m_GatherSubscriber);
+            delete session;
         }
+
         return m_CandChannels.size() > 0;
     }
 
-    bool Stream::ConnectivityCheck(CandPeerContainer & candPeers)
+    bool Stream::ConnectivityCheck(bool bControlling, CandPeerContainer & candPeers, const UTILITY::AuthInfo &lAuthInfo, const UTILITY::AuthInfo &rAuthInfo)
     {
+        m_LocalAuthInfo     = lAuthInfo;
+        m_RemoteAuthInfo    = rAuthInfo;
+        m_bControlling      = bControlling;
+
         for (auto peer_itor = candPeers.begin(); peer_itor != candPeers.end(); ++peer_itor)
         {
-            const Candidate &lcand = (*peer_itor)->LCandidate();
-            const Candidate &rcand = (*peer_itor)->LCandidate();
+            const Candidate &lcand = peer_itor->LCandidate();
+            const Candidate &rcand = peer_itor->RCandidate();
 
             auto candchannel_itor = m_CandChannels.find(const_cast<Candidate*>(&lcand));
 
             assert(candchannel_itor != m_CandChannels.end());
 
-            auto channel    = candchannel_itor->second;
-            auto sess_itor  = m_CheckSessions.find(channel);
+            auto channel = candchannel_itor->second;
+            auto sess_itor = m_CheckSessions.find(channel);
 
-            CheckSession *pSession(nullptr);
+            CheckSession* pSession(nullptr);
 
             if (sess_itor == m_CheckSessions.end())
             {
-                switch (lcand.m_Protocol)
-                {
-                case Protocol::udp:
-                    {
-                    auto udpchannel = dynamic_cast<UDPChannel*>(channel);
-                    assert(udpchannel);
-                    pSession = new UDPCheckSession(*this, *udpchannel, m_LocalAuthInfo, m_RemoteAuthInfo);
-                    }
-                    break;
-
-                case Protocol::tcp_pass:
-                    {
-                    auto tcppasschannel = dynamic_cast<TCPPassiveChannel*>(channel);
-                    assert(tcppasschannel);
-                    pSession = new TCPPassCheckSession(*this, *tcppasschannel, m_LocalAuthInfo, m_RemoteAuthInfo);
-                    }
-                    break;
-
-                case Protocol::tcp_act:
-                    {
-                        auto tcpactchannel = dynamic_cast<TCPActiveChannel*>(channel);
-                        assert(tcpactchannel);
-                        pSession = new TCPActCheckSession(*this, *tcpactchannel, m_LocalAuthInfo, m_RemoteAuthInfo);
-                    }
-                    break;
-
-                default:
-                    break;
-                }
+                if(m_LocalProtocol == Protocol::udp)
+                    pSession = new UDPCheckSession(*this, *channel, sUDPTimeoutInterval, m_LocalAuthInfo, m_RemoteAuthInfo);
+                else
+                    pSession = new TCPCheckSession(*this, *channel, sTCPTimeoutInterval, m_LocalAuthInfo, m_RemoteAuthInfo);
             }
             else
+            {
                 pSession = sess_itor->second;
+            }
 
             if (!pSession)
             {
                 LOG_ERROR("Stream", "Connectivity Check failed to Create check session [%s:%d] => [%s:%d]",
                     channel->IP().c_str(), channel->Port(),
                     rcand.m_ConnIP.c_str(), rcand.m_ConnPort);
-                return false;
+                continue;
             }
 
-            if (!pSession->CreateChecker(*candchannel_itor->second, lcand, rcand))
+            if (!pSession->CreateChecker(lcand, rcand))
             {
-                LOG_ERROR("Stream", "Connectivity Check failed to Create check session [%s:%d] => [%s:%d]",
+                LOG_ERROR("Stream", "Connectivity Check failed to Create check [%s:%d] => [%s:%d]",
                     channel->IP().c_str(), channel->Port(),
                     rcand.m_ConnIP.c_str(), rcand.m_ConnPort);
-                return false;
+
+                if (sess_itor == m_CheckSessions.end())
+                    delete pSession;
+                continue;
             }
 
-            if (!pSession->CheckerNumber())
+            if (sess_itor == m_CheckSessions.end() && !m_CheckSessions.insert(std::make_pair(channel, pSession)).second)
             {
-                LOG_WARNING("Stream", "CheckSession has no checker");
-                if (sess_itor != m_CheckSessions.end())
-                    m_CheckSessions.erase(sess_itor);
-                delete pSession;
-            }
-
-            if (!m_CheckSessions.insert(std::make_pair(channel, pSession)).second)
-            {
-                LOG_ERROR("Stream", "Connectivity Check failed to Create check session [%s:%d] => [%s:%d]",
+                LOG_ERROR("Stream", "Connectivity Check failed to insert [%p], [%s:%d] => [%s:%d]",
+                    channel,
                     channel->IP().c_str(), channel->Port(),
                     rcand.m_ConnIP.c_str(), rcand.m_ConnPort);
-                return false;
+
+                if (sess_itor == m_CheckSessions.end())
+                    delete pSession;
+                continue;
             }
+
         }
 
         for (auto sess_itor = m_CheckSessions.begin(); sess_itor != m_CheckSessions.end(); ++sess_itor)
         {
-            if (!sess_itor->second->Start())
+            if (!sess_itor->second->Initilize())
             {
                 LOG_ERROR("Stream", "Connectivity Check cannot Start check session %lld", sess_itor->second);
-                return false;
+                continue;
             }
         }
+
+
         return true;
+    }
+
+    void Stream::GetCandidates(CandContainer & Cands) const
+    {
+        std::for_each(m_CandChannels.begin(), m_CandChannels.end(), [&Cands](auto &itor) {
+            Cands.push_back(itor.first);
+        });
     }
 
     bool Stream::GatherHostCandidate(const std::string & localIP, uint16_t port)
     {
-        std::auto_ptr<Channel> channel(CreateChannel(m_LocalProtocol, localIP, port));
+        /*
+        !!!! Notice !!!!
+        in Gather Phase, just create UDPChannel or TCPChannel. DONOT create TCPPassiveChannel
+        */
+        std::auto_ptr<Channel> channel(CreateChannel(m_LocalProtocol == Protocol::udp ? m_LocalProtocol : Protocol::tcp_act,
+            localIP, port));
 
         if (!channel.get())
         {
@@ -926,7 +367,7 @@ namespace STUN {
         }
 
         auto foundation = Candidate::ComputeFoundations(Candidate::CandType::host, localIP, localIP, m_LocalProtocol);
-        auto priority   = Candidate::ComputePriority(Candidate::CandType::host, m_LocalPref, m_ComponentId);
+        auto priority   = Candidate::ComputePriority(Candidate::CandType::host, Configuration::Instance().LocalPref(), m_ComponentId);
 
         std::auto_ptr<Candidate> cand(CreateHostCandidte(m_LocalProtocol, priority, foundation, localIP, port));
 
@@ -950,7 +391,13 @@ namespace STUN {
 
     bool Stream::GatherSvrCandidate(const std::string& localIP, uint16_t lowPort, uint16_t highPort, const std::string& stunserver, uint16_t stunport)
     {
-        std::auto_ptr<Channel> channel(CreateChannel(m_LocalProtocol, localIP, lowPort, highPort, m_MaxTries));
+        /*
+            !!!!Notice !!!!
+            in Gather Phase, just create UDPChannel or TCPChannel.DONOT create TCPPassiveChannel
+        */
+
+        auto protocol = m_LocalProtocol == Protocol::udp ? m_LocalProtocol : Protocol::tcp_act;
+        std::auto_ptr<Channel> channel(CreateChannel(protocol, localIP, lowPort, highPort, m_MaxTries));
 
         if (!channel.get())
         {
@@ -963,9 +410,9 @@ namespace STUN {
 
         std::auto_ptr<GatherSession> session(nullptr);
         if (m_LocalProtocol == Protocol::udp)
-            session.reset(new GatherSession(this, UDPTimeoutInterval, id, *channel.get(), stunserver, stunport));
+            session.reset(new GatherSession(this, sUDPTimeoutInterval, id, *channel.get(), stunserver, stunport));
         else
-            session.reset(new TCPGatherSession(this, TCPTimeoutInterval, id, *channel.get(), stunserver, stunport));
+            session.reset(new TCPGatherSession(this, sTCPTimeoutInterval, id, *channel.get(), stunserver, stunport));
 
         if (!session.get())
         {
@@ -979,23 +426,24 @@ namespace STUN {
             return false;
         }
 
-        std::lock_guard<decltype(m_SessionChannelMutex)> locker(m_SessionChannelMutex);
-        if (!m_SessionChannels.insert(std::make_pair(session.get(), channel.get())).second)
+        std::lock_guard<decltype(m_GatherSessionMutex)> locker(m_GatherSessionMutex);
+        if (!m_PendingGatherSessions.insert(std::make_pair(session.get(), channel.get())).second)
         {
             LOG_ERROR("Stream", "GatherSvrCandidate Failed to create session channel pair");
             return false;
         }
 
-        if (!session->Start())
+        if (!session->Initilize())
         {
             LOG_ERROR("Stream", "Start Gather Session failed");
-            m_SessionChannels.erase(session.get());
+            m_PendingGatherSessions.erase(session.get());
             return false;
         }
 
+        session.release();
+        channel.release();
         return true;
     }
-
 
     Channel* Stream::CreateChannel(Protocol protocol, const std::string &ip, uint16_t port)
     {
@@ -1005,7 +453,7 @@ namespace STUN {
             return CreateChannel<UDPChannel>(ip, port);
 
         case Protocol::tcp_act:
-            CreateChannel<TCPActiveChannel>(ip, port);
+            return CreateChannel<TCPChannel>(ip, port);
 
         case Protocol::tcp_pass:
             return CreateChannel<TCPPassiveChannel>(ip, port);
@@ -1024,7 +472,7 @@ namespace STUN {
             return CreateChannel<UDPChannel>(ip, lowport, upperport, tries);
 
         case Protocol::tcp_act:
-            CreateChannel<TCPActiveChannel>(ip, lowport, upperport, tries);
+            return CreateChannel<TCPChannel>(ip, lowport, upperport, tries);
 
         case Protocol::tcp_pass:
             return CreateChannel<TCPPassiveChannel>(ip, lowport, upperport, tries);
@@ -1059,7 +507,7 @@ namespace STUN {
         switch (protocol)
         {
         case Protocol::udp:
-            return new  SvrCand(pri, foundation, connIP, connPort,baseIP, basePort);
+            return new  SvrCand(pri, foundation, connIP, connPort, baseIP, basePort);
 
         case Protocol::tcp_act:
             return new SvrActiveCand(pri, foundation, connIP, connPort, baseIP, basePort);
@@ -1073,10 +521,11 @@ namespace STUN {
         }
     }
 
-
+    /////////////////////////////////////// GatherSession class ////////////////////////////////////////////////
     Stream::GatherSession::GatherSession(const Stream* pOwner, const TimeOutInterval& timeout, STUN::TransIdConstRef id, Channel & channel,
         const std::string& targetIP, uint16_t port) :
-        m_ReqMsg(id), m_timeout(timeout), m_Channel(channel),m_pOwner(pOwner),m_TargetIP(targetIP), m_TargetPort(port),m_Status(Status::waiting_resp)
+        m_ReqMsg(id), m_timeout(timeout), m_Channel(channel), m_pOwner(pOwner), m_TargetIP(targetIP), m_TargetPort(port), m_Status(Status::waiting_resp),
+        m_pCandidate(nullptr)
     {
         RegisterMsg(static_cast<PG::MsgEntity::MSG_ID>(Message::StatusChange));
         assert(pOwner);
@@ -1085,58 +534,79 @@ namespace STUN {
     Stream::GatherSession::~GatherSession()
     {
         if (m_RecvThrd.joinable())
+        {
+            LOG_INFO("GatherSession", "Close RecvThread");
             m_RecvThrd.join();
-
+        }
         if (m_SendThrd.joinable())
             m_SendThrd.join();
+
+        LOG_INFO("GatherSession", "~GatherSession");
     }
 
-    bool Stream::GatherSession::Start()
+    bool Stream::GatherSession::Initilize()
     {
         assert(m_pOwner->m_LocalProtocol == Protocol::udp);
-        assert(m_Status == Status::waiting_resp);
 
-        UDPChannel *pChannel = dynamic_cast<UDPChannel*>(&m_Channel);
-        assert(pChannel);
-
-        if (!pChannel->BindRemote(m_TargetIP, m_TargetPort))
+        if (!m_Channel.Connect(m_TargetIP, m_TargetPort))
         {
-            LOG_ERROR("GatherSession", "Bind Remote Server Failed [%s:%d]", m_TargetIP.c_str(), m_TargetPort);
+            LOG_ERROR("GatherSession", "Connect Remote Server Failed [%s:%d]", m_TargetIP.c_str(), m_TargetPort);
             return false;
         }
 
-        m_RecvThrd = std::thread(RecvThread, this);
+        OnStart();
         return true;
+    }
+
+    void Stream::GatherSession::OnStart()
+    {
+        assert(m_Status == Status::waiting_resp);
+        m_SendThrd = std::thread(SendThread, this);
+        m_RecvThrd = std::thread(RecvThread, this);
     }
 
     void Stream::GatherSession::OnStunMessage(const STUN::FirstBindRespMsg & respMsg)
     {
         LOG_INFO("Stream", "GatherSession Received Bind Response");
 
-        const STUN::ATTR::XorMappedAddr *pXormapAddr(nullptr);
-        if (respMsg.GetAttribute(pXormapAddr))
+        bool bSucceed = false;
+        std::string ip;
+        uint16_t port;
+
+        {
+            const STUN::ATTR::MappedAddress *pMappedAddr(nullptr);
+            const STUN::ATTR::XorMappedAddr *pXormapAddr(nullptr);
+            const STUN::ATTR::XorMappedAddress *pXormappedAddr(nullptr);
+            if (respMsg.GetAttribute(pMappedAddr))
+            {
+                bSucceed = true;
+                ip = pMappedAddr->IP();
+                port = pMappedAddr->Port();
+            }
+            else if (respMsg.GetAttribute(pXormapAddr))
+            {
+                bSucceed = true;
+                ip = pXormapAddr->IP();
+                port = pXormapAddr->Port();
+            }
+            else if (respMsg.GetAttribute(pXormappedAddr))
+            {
+                bSucceed = true;
+                ip = pXormappedAddr->IP();
+                port = pXormappedAddr->Port();
+            }
+        }
+
+        if (bSucceed)
         {
             auto foundation = Candidate::ComputeFoundations(Candidate::CandType::svr_ref, m_Channel.IP(), m_TargetIP, m_pOwner->m_LocalProtocol);
-            auto priority   = Candidate::ComputePriority(Candidate::CandType::svr_ref, m_pOwner->m_LocalPref, m_pOwner->m_ComponentId);
-            auto candidate  = Stream::CreateSvrCandidate(m_pOwner->m_LocalProtocol, priority, foundation,
-                pXormapAddr->IP(), pXormapAddr->Port(),
+            auto priority   = Candidate::ComputePriority(Candidate::CandType::svr_ref, Configuration::Instance().LocalPref(), m_pOwner->m_ComponentId);
+            m_pCandidate    = Stream::CreateSvrCandidate(m_pOwner->m_LocalProtocol, priority, foundation,
+                ip, port,
                 m_Channel.IP(), m_Channel.Port());
 
             std::unique_lock<decltype(m_StatusMutex)> locker(m_StatusMutex);
-            if (!candidate)
-            {
-                m_Status = Status::failed;
-                LOG_ERROR("GatherSession", "Create Candidate Failed, [%s : %d] => [%s : %d]",
-                    m_Channel.IP(), m_Channel.Port(), m_TargetIP.c_str(), m_TargetPort);
-            }
-            else
-            {
-                m_Status = Status::succeed;
-                LOG_INFO("GatherSession", "Create Candidate Succeed, [%s : %d] => [%s : %d]",
-                    m_Channel.IP(), m_Channel.Port(), m_TargetIP.c_str(), m_TargetPort);
-            }
-
-            Publish(static_cast<uint16_t>(Message::StatusChange), PG::MsgEntity::WPARAM(m_Status == Status::succeed), PG::MsgEntity::LPARAM(candidate));
+            m_Status = m_pCandidate ? Status::succeed : Status::failed;
             m_StatusCond.notify_one();
         }
     }
@@ -1146,7 +616,6 @@ namespace STUN {
         LOG_INFO("Stream", "GatherSession Received Bind Error Response, Set Status to failed");
         std::unique_lock<decltype(m_StatusMutex)> locker(m_StatusMutex);
         m_Status = Status::failed;
-        Publish(static_cast<uint16_t>(Message::StatusChange), PG::MsgEntity::WPARAM(m_Status == Status::succeed), nullptr);
         m_StatusCond.notify_one();
     }
 
@@ -1158,9 +627,15 @@ namespace STUN {
         {
             STUN::PACKET::stun_packet packet;
 
-            auto bytes = pThis->m_Channel.Read(&packet, sizeof(packet));
-
-            if (STUN::MessagePacket::IsValidStunPacket(packet, bytes))
+            auto bytes = pThis->m_Channel.Recv(&packet, sizeof(packet));
+            if (bytes <= 0)
+            {
+                // wake up send thread
+                pThis->m_Status = Status::failed;
+                pThis->m_StatusCond.notify_one();
+                break;
+            }
+            else if (STUN::MessagePacket::IsValidStunPacket(packet, bytes))
             {
                 switch (packet.MsgId())
                 {
@@ -1178,16 +653,16 @@ namespace STUN {
                 }
             }
             std::lock_guard<decltype(pThis->m_StatusMutex)> locker(pThis->m_StatusMutex);
-        } while (pThis->m_Status != Status::waiting_resp);
+        } while (pThis->m_Status == Status::waiting_resp);
     }
 
     void Stream::GatherSession::SendThread(GatherSession * pThis)
     {
         auto cnt = pThis->m_timeout.size();
 
-        for (decltype(cnt) i = 0; cnt < cnt; ++i)
+        for (decltype(cnt) i = 0; i < cnt; ++i)
         {
-            auto start  = std::chrono::steady_clock::now();
+            auto start = std::chrono::steady_clock::now();
             if (!pThis->m_ReqMsg.SendData(pThis->m_Channel))
             {
                 LOG_ERROR("GatherSession", "Failed to send request message");
@@ -1205,31 +680,31 @@ namespace STUN {
             });
 
             if (ret)
-                return;
+                break;
 
-            LOG_ERROR("GatherSession", "transmit cnt = %d", i);
+            LOG_ERROR("GatherSession", "[%s:%d] =>[%s:%d]transmit cnt (= %d)",
+                pThis->m_Channel.IP().c_str(), pThis->m_Channel.Port(),
+                pThis->m_TargetIP.c_str(), pThis->m_TargetPort,
+                i + 1);
         }
 
-        LOG_ERROR("GatherSession", "time out [%s:%d] => [%s:%d]",
-            pThis->m_Channel.IP(), pThis->m_Channel.Port(),
-            pThis->m_Channel.PeerIP(), pThis->m_Channel.PeerPort());
-
-        // shutdown read to force read function return
-        pThis->m_Channel.Shutdown(Channel::ShutdownType::read);
-
         std::lock_guard<decltype(pThis->m_StatusMutex)> locker(pThis->m_StatusMutex);
-        pThis->m_Status = Status::failed;
-        pThis->Publish(static_cast<uint16_t>(Message::StatusChange), PG::MsgEntity::WPARAM(false), nullptr);
+        if (pThis->m_Status == Status::waiting_resp)
+        {
+            LOG_ERROR("GatherSession", "GatherSession failed because of timeout");
+            pThis->m_Status = Status::failed;
+        }
+        pThis->Publish(static_cast<uint16_t>(Message::StatusChange), PG::MsgEntity::WPARAM(pThis->m_Status == Status::succeed), nullptr);
     }
 
-
+    /////////////////////////////////////// TCPGatherSession class ////////////////////////////////////////////////
     Stream::TCPGatherSession::~TCPGatherSession()
     {
         if (m_ConnectThrd.joinable())
             m_ConnectThrd.join();
     }
 
-    bool Stream::TCPGatherSession::Start()
+    bool Stream::TCPGatherSession::Initilize()
     {
         assert(m_Status == Status::waiting_resp);
         m_ConnectThrd = std::thread(ConnectThread, this);
@@ -1241,10 +716,9 @@ namespace STUN {
         assert(pThis);
         assert(pThis->m_pOwner->m_LocalProtocol != Protocol::udp);
 
-        TCPChannel *channel = dynamic_cast<TCPChannel*>(&pThis->m_Channel);
-        assert(channel);
+        LOG_INFO("Stream", "[%s:%d] Try to connect [%s:%d]", pThis->m_Channel.IP().c_str(), pThis->m_Channel.Port(), pThis->m_TargetIP.c_str(), pThis->m_TargetPort);
 
-        if (!channel->Connect(pThis->m_TargetIP, pThis->m_TargetPort))
+        if (!pThis->m_Channel.Connect(pThis->m_TargetIP, pThis->m_TargetPort))
         {
             LOG_ERROR("TCP GatherSession", "Connect failed [%s:%d]",
                 pThis->m_TargetIP.c_str(), pThis->m_TargetPort);
@@ -1254,63 +728,327 @@ namespace STUN {
             return;
         }
 
-        pThis->m_RecvThrd = std::thread(GatherSession::RecvThread, pThis);
-        pThis->m_SendThrd = std::thread(GatherSession::SendThread, pThis);
+        pThis->OnStart();
     }
 
-    void Stream::GatherSubscriber::OnPublished(const PG::Publisher * publisher, MsgEntity::MSG_ID msgId, MsgEntity::WPARAM wParam, MsgEntity::LPARAM lParam)
+    void Stream::GatherSubscriber::OnPublished(const PG::Publisher * publisher, PG::MsgEntity::MSG_ID msgId, PG::MsgEntity::WPARAM wParam, PG::MsgEntity::LPARAM lParam)
     {
         assert(m_pOwner && publisher);
 
-        std::lock_guard<decltype(m_pOwner->m_SessionChannelMutex)> locker(m_pOwner->m_SessionChannelMutex);
+        std::lock_guard<decltype(m_pOwner->m_GatherSessionMutex)> locker(m_pOwner->m_GatherSessionMutex);
 
         auto session = reinterpret_cast<const GatherSession*>(publisher);
 
-        auto itor = m_pOwner->m_SessionChannels.find(const_cast<GatherSession*>(session));
+        auto itor = m_pOwner->m_PendingGatherSessions.find(const_cast<GatherSession*>(session));
 
-        assert(itor != m_pOwner->m_SessionChannels.end());
+        assert(itor != m_pOwner->m_PendingGatherSessions.end());
         assert(static_cast<GatherSession::Message>(msgId) == GatherSession::Message::StatusChange);
 
-        if (wParam)
+        LOG_INFO("Stream", "Gather Session has been completed [%s]", wParam ? "Succeed" : "Failed");
+
+        if (!m_pOwner->m_GatherSessions.insert(std::make_pair(itor->first, itor->second)).second)
         {
-            assert(lParam);
-            std::lock_guard<decltype(m_pOwner->m_CandChannelsMutex)> l(m_pOwner->m_CandChannelsMutex);
-            //auto cand = reinterpret_cast<Candidate*>(lParam);
-            if (!m_pOwner->m_CandChannels.insert(std::make_pair(reinterpret_cast<const Candidate*>(lParam), itor->second)).second)
-            {
-                delete reinterpret_cast<Candidate*>(lParam);
-                LOG_ERROR("Stream", "Gather succeed, but create candidate channel pair failed");
-            }
+            LOG_ERROR("GatherSession", "GatherSession insert error");
         }
 
+        m_pOwner->m_PendingGatherSessions.erase(itor);
+        if (m_pOwner->m_PendingGatherSessions.empty())
+            m_pOwner->m_GatherSessionCond.notify_one();
+
         m_pOwner->m_TaCond.notify_one();
-
-        if (!m_pOwner->m_SessionCnt--)
-            m_pOwner->m_SessionChannelCond.notify_one();
     }
 
-    ////////////////////// CheckSession class //////////////////////
-    Stream::CheckSession::CheckSession(Stream &Owner, const UTILITY::AuthInfo & lAuthInfo, const UTILITY::AuthInfo & rAuthInfo):
-        m_Owner(Owner), m_LocalAuthInfo(lAuthInfo),m_RemoteAuthInfo(rAuthInfo)
+    /////////////////////////////////////// Checker class ////////////////////////////////////////////////
+    class Stream::CheckSession::Checker {
+    public:
+        Checker(CheckSession& owner, const Candidate& lcand, const Candidate& rcand);
+        ~Checker();
+
+    protected:
+        enum class Status : uint16_t {
+            waiting_resp = 0,
+            failed,
+            succeed,
+            quit,
+        };
+
+    public:
+        bool Start();
+        const uint64_t* TransId2Key() const { return reinterpret_cast<const uint64_t*>(m_Id); }
+        const Candidate& RemoteCandidate() const { return m_RemoteCandidate;}
+        const Candidate& LocalCandidate()  const { return m_LocalCandidate; }
+
+    public:
+        void OnStunMessage(const STUN::SubBindRespMsg &respMsg);
+        void OnStunMessage(const STUN::SubBindErrRespMsg &errRespMsg);
+        void OnRecvErrorEvent();
+
+    private:
+        void SetStatus(Status eStatus);
+
+    private:
+        static void SendThread(Checker* pThis);
+
+    private:
+        const Candidate         &m_LocalCandidate;
+        const Candidate         &m_RemoteCandidate;
+        CheckSession            &m_Owner;
+        STUN::TransId            m_Id;
+        STUN::SubBindReqMsg     *m_pReqMsg;
+        std::thread             m_SendThread;
+
+        std::mutex              m_StatusMutex;
+        std::condition_variable m_StatusCond;
+        Status                  m_Status;
+    };
+
+    Stream::CheckSession::Checker::Checker(CheckSession & owner, const Candidate & lcand, const Candidate & rcand) :
+        m_Owner(owner), m_LocalCandidate(lcand), m_RemoteCandidate(rcand), m_pReqMsg(nullptr),m_Status(Status::waiting_resp)
     {
-        RegisterMsg(static_cast<PG::MsgEntity::MSG_ID>(Message::ConnectivityCheck));
-        RegisterMsg(static_cast<PG::MsgEntity::MSG_ID>(Message::RoleConflict));
-        RegisterMsg(static_cast<PG::MsgEntity::MSG_ID>(Message::Nominate));
+        STUN::MessagePacket::GenerateRFC5389TransationId(m_Id);
     }
 
-    bool Stream::CheckSession::CreateChecker(Channel &channel, const Candidate& lcand, const Candidate &rcand)
+    Stream::CheckSession::Checker::~Checker()
     {
-        std::string key = MakeKey(rcand.m_ConnIP, rcand.m_ConnPort);
+        delete m_pReqMsg;
+        if (m_SendThread.joinable())
+            m_SendThread.join();
+    }
 
-        assert(m_Checks.find(key) == m_Checks.end());
+    bool Stream::CheckSession::Checker::Start()
+    {
+        assert(m_Status == Status::waiting_resp);
 
-        STUN::TransId id;
-        STUN::MessagePacket::GenerateRFC5389TransationId(id);
+        m_SendThread = std::thread(SendThread, this);
+        return true;
+    }
 
-        std::auto_ptr<Checker> checker(new Checker(*this, channel, lcand, rcand, id, m_Owner.m_bControlling, m_Owner.m_TieBreaker));
-        if (!checker.get() || !m_Checks.insert(std::make_pair(key, checker.get())).second)
+    void Stream::CheckSession::Checker::OnStunMessage(const STUN::SubBindRespMsg & respMsg)
+    {
+        using namespace STUN;
+
+        LOG_INFO("CheckSession", "SubBindRespMsg Received");
+        const ATTR::MessageIntegrity *pMsgIntegrity(nullptr);
+        if (!respMsg.GetAttribute(pMsgIntegrity) || !MessagePacket::VerifyMsgIntegrity(respMsg, m_Owner.m_LAuthInfo._pwd))
         {
-            LOG_ERROR("CheckSession", "Cannot Create Checker");
+            /*
+            RFC5389 [10.1.3.  Receiving a Response]
+            If the value does not match, or if
+            MESSAGE-INTEGRITY was absent, the response MUST be discarded, as if
+            it was never received
+            */
+        }
+        else if (respMsg.GetUnkonwnAttrs().size())
+        {
+            /*
+            RFC5389 [7.3.3.  Processing a Success Response]
+            If the success response contains unknown comprehension-required
+            attributes, the response is discarded and the transaction is
+            considered to have failed.
+            */
+            std::lock_guard<decltype(m_StatusMutex)> locker(m_StatusMutex);
+            m_Status = Status::failed;
+            m_StatusCond.notify_one();
+        }
+
+        const ATTR::XorMappedAddress *pXorMapAddr(nullptr);
+        if (respMsg.GetAttribute(pXorMapAddr))
+        {
+            /*
+            RFC5245 [7.1.3.1.  Failure Cases]
+            The agent MUST check that the source IP address and port of the
+            response equal the destination IP address and port to which the
+            Binding request was sent, and that the destination IP address and
+            port of the response match the source IP address and port from which
+            the Binding request was sent.  In other words, the source and
+            destination transport addresses in the request and responses are
+            symmetric.  If they are not symmetric, the agent sets the state of
+            the pair to Failed.
+            */
+            if (pXorMapAddr->IP() == m_LocalCandidate.m_BaseIP && pXorMapAddr->Port() == m_LocalCandidate.m_BasePort)
+            {
+                LOG_INFO("Checker", "valid resp msg L<=>R [%s:%d] <=>[%s:%d]",
+                    m_LocalCandidate.m_BaseIP.c_str(), m_LocalCandidate.m_BasePort,
+                    m_RemoteCandidate.m_ConnIP.c_str(), m_RemoteCandidate.m_ConnPort);
+
+                std::lock_guard<decltype(m_StatusMutex)> locker(m_StatusMutex);
+                m_Status = Status::succeed;
+                m_StatusCond.notify_one();
+            }
+            else
+            {
+                LOG_ERROR("Stream", "SubRespMsg unsymmetric address");
+                std::lock_guard<decltype(m_StatusMutex)> locker(m_StatusMutex);
+                m_Status = Status::failed;
+                m_StatusCond.notify_one();
+            }
+        }
+        else
+        {
+            std::lock_guard<decltype(m_StatusMutex)> locker(m_StatusMutex);
+            m_Status = Status::failed;
+            m_StatusCond.notify_one();
+        }
+    }
+
+    void Stream::CheckSession::Checker::OnStunMessage(const STUN::SubBindErrRespMsg & errRespMsg)
+    {
+        using namespace STUN;
+
+        const ATTR::ErrorCode *pErrCode(nullptr);
+        const ATTR::MessageIntegrity *pMsgIntegrity(nullptr);
+
+        LOG_INFO("CheckSession", "SubBindErrRespMsg Received");
+
+        if (!errRespMsg.GetAttribute(pMsgIntegrity) || !MessagePacket::VerifyMsgIntegrity(errRespMsg, m_Owner.m_RAuthInfo._pwd))
+        {
+            /*
+            RFC5389[10.2.3.  Receiving a Response]
+            The client looks for the MESSAGE-INTEGRITY attribute in the response
+            (either success or failure).  If present, the client computes the
+            message integrity over the response as defined in Section 15.4, using
+            the same password it utilized for the request.  If the resulting
+            value matches the contents of the MESSAGE-INTEGRITY attribute, the
+            response is considered authenticated.  If the value does not match,
+            or if MESSAGE-INTEGRITY was absent, the response MUST be discarded,
+            as if it was never received.  This means that retransmits, if
+            applicable, will continue.
+            */
+            LOG_WARNING("Stream", "SubErrRespMsg cannot be authenticated, just discard this msg");
+        }
+        else if (!errRespMsg.GetAttribute(pErrCode))
+        {
+            /*
+            there is no error code, invalid error resp message, set the status to failed
+            */
+            SetStatus(Status::failed);
+        }
+
+        auto errorCode = pErrCode->Code();
+
+        if (errorCode == 487)
+        {
+            /*
+            RFC8445 [7.2.5.1.  Role Conflict]
+            */
+            LOG_ERROR("Checker", "Role Conflict");
+        }
+        else if ( (errorCode >= 300 && errorCode <= 399) ||
+                  (errorCode >= 400 && errorCode <= 499) )
+        {
+            /*
+            RFC5389 [7.3.3.  Processing a Success Response]
+            If the error code is 300 through 399, the client SHOULD consider
+            the transaction as failed unless the ALTERNATE-SERVER extension is
+            being used.  See Section 11.
+
+            o  If the error code is 400 through 499, the client declares the
+            transaction failed; in the case of 420 (Unknown Attribute), the
+            response should contain a UNKNOWN-ATTRIBUTES attribute that gives
+            additional information.
+            */
+            SetStatus(Status::failed);
+        }
+        else if (errorCode >= 500 && errorCode <= 599)
+        {
+            /*
+            o  If the error code is 500 through 599, the client MAY resend the
+            request; clients that do so MUST limit the number of times they do
+            this.
+            */
+        }
+    }
+
+    void Stream::CheckSession::Checker::OnRecvErrorEvent()
+    {
+        LOG_ERROR("Checker", "On recv error");
+        std::lock_guard<decltype(m_StatusMutex)> locker(m_StatusMutex);
+        m_Status = Status::failed;
+        m_StatusCond.notify_one();
+    }
+
+    void Stream::CheckSession::Checker::SetStatus(Status eStatus)
+    {
+        assert(eStatus != Status::waiting_resp);
+
+        std::lock_guard<decltype(m_StatusMutex)> locker(m_StatusMutex);
+
+        m_Status = eStatus;
+        m_StatusCond.notify_one();
+    }
+
+    void Stream::CheckSession::Checker::SendThread(Checker * pThis)
+    {
+        assert(pThis && !pThis->m_pReqMsg);
+        //std::this_thread::sleep_for(std::chrono::seconds(1000000));
+        pThis->m_pReqMsg = new STUN::SubBindReqMsg(pThis->m_LocalCandidate.m_Priority, pThis->m_Id, true, 0,
+            pThis->m_Owner.m_RAuthInfo._ufrag + ":" + pThis->m_Owner.m_LAuthInfo._ufrag,
+            pThis->m_Owner.m_RAuthInfo._pwd);
+
+        if (pThis->m_pReqMsg)
+        {
+            auto timer_cnt = pThis->m_Owner.m_Timer.size();
+
+            auto& recver_ip = pThis->RemoteCandidate().m_ConnIP;
+            auto  recver_port = pThis->RemoteCandidate().m_ConnPort;
+
+            for (decltype(timer_cnt) i = 0; i < timer_cnt; ++i)
+            {
+                if (!pThis->m_pReqMsg->SendData(pThis->m_Owner.m_Channel, recver_ip, recver_port))
+                {
+                    LOG_ERROR("Checker", "Cannot Send Data [%s:%d] => [%s:%d], set status to failed",
+                        pThis->m_LocalCandidate.m_BaseIP.c_str(), pThis->m_LocalCandidate.m_BasePort,
+                        pThis->m_RemoteCandidate.m_ConnIP.c_str(), pThis->m_RemoteCandidate.m_ConnPort);
+
+                    pThis->SetStatus(Status::failed);
+                    break;
+                }
+
+                std::unique_lock<decltype(pThis->m_StatusMutex)> locker(pThis->m_StatusMutex);
+                auto ret = pThis->m_StatusCond.wait_for(locker, std::chrono::milliseconds(pThis->m_Owner.m_Timer[i]), [pThis]() {
+                    return pThis->m_Status != Status::waiting_resp;
+                });
+
+                if (ret)
+                {
+                    LOG_INFO("Check", "%s, [%s : %d] => [%s : %d]",
+                        (pThis->m_Status == Status::succeed ? "Succeed" : "Failed"),
+                        pThis->m_LocalCandidate.m_BaseIP.c_str(), pThis->m_LocalCandidate.m_BasePort,
+                        pThis->m_RemoteCandidate.m_ConnIP.c_str(), pThis->m_RemoteCandidate.m_BasePort);
+                    break;
+                }
+            }
+        }
+        pThis->m_Owner.OnCheckerCompleted(*pThis, pThis->m_Status == Status::succeed);
+    }
+
+    /////////////////////////////////////// CheckSession class ////////////////////////////////////////////////
+    Stream::CheckSession::CheckSession(Stream & owner, Channel & channel, const TimeOutInterval& timer,
+        const UTILITY::AuthInfo & lauthInfo,const UTILITY::AuthInfo & rauthInfo)
+        : m_Owner(owner), m_Channel(channel), m_Timer(timer),m_LAuthInfo(lauthInfo), m_RAuthInfo(rauthInfo)
+    {
+        RegisterMsg(static_cast<PG::MsgEntity::MSG_ID>(Message::StatusChanged));
+    }
+
+    Stream::CheckSession::~CheckSession()
+    {
+        if (m_RecvThrd.joinable())
+            m_RecvThrd.join();
+    }
+
+    bool Stream::CheckSession::CreateChecker(const Candidate & lcand, const Candidate & rcand)
+    {
+        std::auto_ptr<Checker> checker(new Checker(*this, lcand, rcand));
+        if (!checker.get())
+            return false;
+
+        auto ret = m_Checks.insert(std::make_pair(checker->TransId2Key(), checker.get()));
+        if (!ret.second)
+            return false;
+
+        if (!checker->Start())
+        {
+            m_Checks.erase(ret.first);
             return false;
         }
 
@@ -1318,82 +1056,204 @@ namespace STUN {
         return true;
     }
 
-    std::string Stream::CheckSession::MakeKey(const std::string & ip, uint16_t port)
-    {
-        try
-        {
-            return ip + boost::lexical_cast<std::string>(port);
-        }
-        catch (const std::exception& e)
-        {
-            LOG_ERROR("CheckSession", "MakeKey exception %s", e.what());
-            return std::string();
-        }
-    }
-
-    Stream::CheckSession::Checker * Stream::CheckSession::FindChecker(const std::string & ip, uint16_t port)
-    {
-        try
-        {
-            auto itor = m_Checks.find(MakeKey(ip,port));
-            return itor == m_Checks.end() ? nullptr : itor->second;
-        }
-        catch (const std::exception& e)
-        {
-            LOG_ERROR("Find Checker exception %s", e.what());
-            return nullptr;
-        }
-
-    }
-
-    Stream::CheckSession::Checker::Checker(CheckSession &Owner, Channel& channel, const Candidate& lcand, const Candidate& rcand, STUN::TransIdConstRef id, bool bControlling, uint64_t tieBreaker) :
-        m_Owner(Owner), m_Channel(channel), m_LCand(lcand),m_RCand(rcand),
-        m_ReqMsg(lcand.m_Priority,id, bControlling, tieBreaker, Owner.m_LocalAuthInfo._ufrag, Owner.m_RemoteAuthInfo._pwd)
-    {
-    }
-
-    Stream::UDPCheckSession::UDPCheckSession(Stream & Owner, UDPChannel & channel, const UTILITY::AuthInfo & lAuthInfo, const UTILITY::AuthInfo & rAuthInfo)
-        : Stream::CheckSession(Owner, lAuthInfo, rAuthInfo),m_Channel(channel)
-    {
-    }
-
-    Stream::UDPCheckSession::~UDPCheckSession()
-    {
-        if (m_RecvThrd.joinable())
-            m_RecvThrd.join();
-    }
-
-    bool Stream::UDPCheckSession::Start()
+    void Stream::CheckSession::OnStart()
     {
         m_RecvThrd = std::thread(RecvThread, this);
     }
 
-    void Stream::UDPCheckSession::RecvThread(UDPCheckSession * pThis)
+    void Stream::CheckSession::OnStunMessage(const STUN::SubBindReqMsg & reqMsg)
+    {
+#if 0
+        using namespace STUN;
+
+        const ATTR::MessageIntegrity *pMsgIntegrity(nullptr);
+        const ATTR::UserName *pUsername(nullptr);
+        const ATTR::Role *pRole(nullptr);
+        const ATTR::Priority *pPriority(nullptr);
+        const ATTR::UseCandidate *pUseCandAttr(nullptr);
+
+        LOG_INFO("CheckSession", "SubBindReqMsg Received");
+        /*
+        RFC8445 [7.1.  STUN Extensions]
+        */
+        if (!reqMsg.GetAttribute(pRole) && !reqMsg.GetAttribute(pPriority))
+        {
+            LOG_WARNING("Stream", "bind request has no role or priority attribute, just discards");
+            return;
+        }
+
+        assert(pRole);
+
+        reqMsg.GetAttribute(pUseCandAttr);
+        if (pRole->Type() == ATTR::Id::IceControlled && pUseCandAttr)
+        {
+            /*
+            RFC8445[7.1.2.  USE-CANDIDATE]
+
+            The controlling agent MUST include the USE-CANDIDATE attribute in
+            order to nominate a candidate pair (Section 8.1.1).  The controlled
+            agent MUST NOT include the USE-CANDIDATE attribute in a Binding
+            request.
+            */
+            LOG_WARNING("Stream", "The controlled agent MUST NOT include the USE - CANDIDATE attribute in a Binding request");
+            return;
+        }
+        /*
+        RFC5389 10.2.2. Receiving a Request
+        */
+        reqMsg.GetAttribute(pMsgIntegrity);
+        reqMsg.GetAttribute(pUsername);
+        if (!pMsgIntegrity && !pUsername)
+        {
+            // 400 bad request
+            SubBindErrRespMsg errRespMsg(m_pReqMsg->TransationId(), 4, 0, "bad-request");
+            errRespMsg.SendData(m_Owner.m_Channel, m_RemoteCandidate.m_ConnIP, m_RemoteCandidate.m_ConnPort);
+        }
+        else if (pUsername && (m_Owner.m_LAuthInfo._ufrag + ":" + m_Owner.m_RAuthInfo._ufrag) != pUsername->Name())
+        {
+            // 401 Unauthorized
+            SubBindErrRespMsg errRespMsg(m_pReqMsg->TransationId(), 4, 1, "unmatched-username");
+            errRespMsg.SendData(m_Owner.m_Channel, m_RemoteCandidate.m_ConnIP, m_RemoteCandidate.m_ConnPort);
+        }
+        else if (!MessagePacket::VerifyMsgIntegrity(reqMsg, m_Owner.m_LAuthInfo._pwd))
+        {
+            // 401 Unauthorized
+            SubBindErrRespMsg errRespMsg(m_pReqMsg->TransationId(), 4, 1, "unmatched-MsgIntegrity");
+            errRespMsg.SendData(m_Owner.m_Channel, m_RemoteCandidate.m_ConnIP, m_RemoteCandidate.m_ConnPort);
+        }
+        else if (reqMsg.GetUnkonwnAttrs().size())
+        {
+            SubBindErrRespMsg errRespMsg(m_pReqMsg->TransationId(), 4, 20, "Unknown-Attribute");
+            errRespMsg.AddUnknownAttributes(reqMsg.GetUnkonwnAttrs());
+            errRespMsg.SendData(m_Owner.m_Channel, m_RemoteCandidate.m_ConnIP, m_RemoteCandidate.m_ConnPort);
+        }
+        else if (m_Owner.IsControlling() == (pRole->Type() == ATTR::Id::IceControlling))
+        {
+            // RFC8445 [7.3.1.1.  Detecting and Repairing Role Conflicts]
+            if ((m_Owner.IsControlling() && m_Owner.TieBreaker() >= pRole->TieBreaker()) ||
+                (!m_Owner.IsControlling() && m_Owner.TieBreaker() < pRole->TieBreaker()))
+            {
+                SubBindErrRespMsg errRespMsg(m_pReqMsg->TransationId(), 4, 87, "Role-Conflict");
+                errRespMsg.SendData(m_Owner.m_Channel, m_RemoteCandidate.m_ConnIP, m_RemoteCandidate.m_ConnPort);
+            }
+            else
+            {
+                //TODO switch role
+            }
+        }
+        else
+        {
+            // now we can send success response message
+            ATTR::XorMappedAddress xorMapAddr;
+            xorMapAddr.Port(m_RemoteCandidate.m_ConnPort);
+
+            assert(boost::asio::ip::address::from_string(m_RemoteCandidate.m_ConnIP).is_v4());
+
+            xorMapAddr.Address(boost::asio::ip::address::from_string(m_RemoteCandidate.m_ConnIP).to_v4().to_uint());
+            SubBindRespMsg respMsg(m_pReqMsg->TransationId(), xorMapAddr);
+            respMsg.SendData(m_Owner.m_Channel, m_RemoteCandidate.m_ConnIP, m_RemoteCandidate.m_ConnPort);
+        }
+#endif
+    }
+
+    void Stream::CheckSession::RecvThread(CheckSession *pThis)
     {
         assert(pThis);
-
-        do
+        while (1)
         {
             STUN::PACKET::stun_packet packet;
-            boost::asio::ip::udp::endpoint sender_ep;
-
-            auto bytes = pThis->m_Channel.ReadFrom(&packet, sizeof(packet), sender_ep);
+            std::string sender_ip;
+            uint16_t sender_port;
+            auto bytes = pThis->m_Channel.Recv(&packet, sizeof(packet), sender_ip, sender_port);
 
             if (STUN::MessagePacket::IsValidStunPacket(packet, bytes))
             {
+
+                if (packet.MsgId() == STUN::MsgType::BindingRequest)
+                {
+                    bool ret = STUN::MessagePacket::VerifyMsgIntegrity(STUN::SubBindReqMsg(packet, bytes), pThis->m_LAuthInfo._pwd);
+                    pThis->OnStunMessage(STUN::SubBindReqMsg(packet, bytes));
+                }
+                else
+                {
+                    auto checker_itor = pThis->m_Checks.find(reinterpret_cast<const uint64_t*>(packet.TransId()));
+                    if (checker_itor == pThis->m_Checks.end())
+                    {
+                        LOG_ERROR("CheckSession", "received message id = [%d] , but no corresponding checker", packet.MsgId());
+                        continue;
+                    }
+                    auto checker = checker_itor->second;
+
+                    switch (packet.MsgId())
+                    {
+                    case STUN::MsgType::BindingErrResp:
+                        checker->OnStunMessage(STUN::SubBindErrRespMsg(packet, bytes));
+                        break;
+
+                    case STUN::MsgType::BindingResp:
+                        checker->OnStunMessage(STUN::SubBindRespMsg(packet, bytes));
+                        break;
+                    default:
+                        break;
+                    }
+                }
             }
-            std::lock_guard<decltype(pThis->m_Mutex)> locker(pThis->m_Mutex);
-        } while (pThis->m_bQuit);
+        }
     }
 
-    Stream::TCPPassCheckSession::TCPPassCheckSession(Stream & Owner, TCPPassiveChannel & channel, const UTILITY::AuthInfo & lAuthInfo, const UTILITY::AuthInfo & rAuthInfo)
-       : Stream::CheckSession(Owner, lAuthInfo, rAuthInfo)
+    void Stream::CheckSession::OnCheckerCompleted(Checker & checker, bool bSucceed)
+    {
+        std::lock_guard<decltype(m_ChecksMutex)> locker(m_ChecksMutex);
+
+        auto key = checker.TransId2Key();
+
+        auto checker_itor = m_Checks.find(key);
+
+        assert(checker_itor != m_Checks.end());
+
+        auto check_container = bSucceed ? m_SucceedChecks : m_FailedChecks;
+
+        check_container.insert(std::make_pair(key, &checker));
+
+        m_Checks.erase(checker_itor);
+        if (m_Checks.empty())
+        {
+            LOG_INFO("CheckSession", "Connectivity completed [%s]", bSucceed ? "Succeed" : "Failed");
+            Publish(static_cast<PG::MsgEntity::MSG_ID>(Message::StatusChanged), nullptr, nullptr);
+        }
+    }
+
+    /////////////////////////////////////// TCPCheckSession class ////////////////////////////////////////////////
+    bool Stream::TCPCheckSession::Initilize()
+    {
+        assert(m_Checks.size() == 1);
+
+        m_ConnThrd = std::thread(ConnectThread, this);
+        return true;
+    }
+
+    void Stream::TCPCheckSession::ConnectThread(TCPCheckSession * pThis)
+    {
+        assert(pThis && pThis->m_Checks.size() == 1);
+
+        auto checker = pThis->m_Checks.begin()->second;
+
+        if (!pThis->m_Channel.Connect(checker->RemoteCandidate().m_ConnIP, checker->RemoteCandidate().m_ConnPort))
+        {
+            pThis->Publish(static_cast<PG::MsgEntity::MSG_ID>(Message::StatusChanged), false, nullptr);
+
+            LOG_ERROR("TCPCheckSession", "cannot make connection to [%s:%d]",
+                checker->RemoteCandidate().m_ConnIP.c_str(),
+                checker->RemoteCandidate().m_ConnPort);
+            return;
+        }
+        pThis->OnStart();
+    }
+
+    void Stream::CheckSessionSubscriber::OnPublished(const PG::Publisher * publisher, PG::MsgEntity::MSG_ID msgId, PG::MsgEntity::WPARAM wParam, PG::MsgEntity::LPARAM lParam)
     {
     }
-
-    Stream::TCPActCheckSession::TCPActCheckSession(Stream & Owner, TCPActiveChannel & channel, const UTILITY::AuthInfo & lAuthInfo, const UTILITY::AuthInfo & rAuthInfo)
-        :Stream::CheckSession(Owner, lAuthInfo, rAuthInfo)
-    {
-    }
-
 }
+
+
+

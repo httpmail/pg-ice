@@ -4,6 +4,7 @@
 #include "media.h"
 #include "stream.h"
 #include "pg_log.h"
+#include "config.h"
 
 #include <boost/tokenizer.hpp>
 #include <boost/lexical_cast.hpp>
@@ -238,9 +239,7 @@ bool CSDP::Encode(const ICE::Session & session, std::string& offer)
     auto Medias = session.GetMedias();
     assert(Medias.size());
 
-    auto config = session.Config();
-
-    bool isIPv4 = boost::asio::ip::address::from_string(config.DefaultIP()).is_v4();
+    bool isIPv4 = boost::asio::ip::address::from_string(session.DefaultIP()).is_v4();
 
     std::ostringstream offer_stream;
 
@@ -250,22 +249,22 @@ bool CSDP::Encode(const ICE::Session & session, std::string& offer)
 
     // encode "o" line
     offer_stream << SDPDEF::o_line
-        << config.UserName() << " "
+        << session.Username() << " "
         << std::chrono::steady_clock::now().time_since_epoch().count() << " "
         << std::chrono::steady_clock::now().time_since_epoch().count() << " "
         << SDPDEF::nettype << " "
         << SDPDEF::addrtype(isIPv4) << " "
-        << config.DefaultIP() << SDPDEF::CRLF;
+        << session.DefaultIP() << SDPDEF::CRLF;
 
     // encode "s" line
     offer_stream << SDPDEF::s_line
-        << config.SessionName() << SDPDEF::CRLF;
+        << session.SessionName() << SDPDEF::CRLF;
 
     // encode "c" line
     offer_stream << SDPDEF::c_line
         << SDPDEF::nettype << " "
         << SDPDEF::addrtype(isIPv4) << " "
-        << config.DefaultIP() << SDPDEF::CRLF;
+        << session.DefaultIP() << SDPDEF::CRLF;
 
     // encode "t" line
     offer_stream << SDPDEF::t_line
@@ -281,7 +280,7 @@ bool CSDP::Encode(const ICE::Session & session, std::string& offer)
         // encode "m" line
         offer_stream << SDPDEF::m_line
             << media_itor->first << " "
-            << rtp->GetHostPort() << " "
+            << rtp->GetDefaultPort() << " "
             << rtp->GetTransportProtocol() << " "
             << 0 << SDPDEF::CRLF;
 
@@ -289,7 +288,7 @@ bool CSDP::Encode(const ICE::Session & session, std::string& offer)
         auto *rtcp = media_itor->second->GetStreamById(static_cast<uint16_t>(ICE::Media::ClassicID::RTCP));
         assert(rtcp);
         offer_stream << SDPDEF::rtcp_line
-            << rtcp->GetHostPort() << SDPDEF::CRLF;
+            << rtcp->GetDefaultPort() << SDPDEF::CRLF;
 
         // encode "a=ice-pwd"
         offer_stream << SDPDEF::icepwd_line
@@ -303,13 +302,14 @@ bool CSDP::Encode(const ICE::Session & session, std::string& offer)
         assert(Streams.size());
         for (auto stream_itor = Streams.begin(); stream_itor != Streams.end(); ++stream_itor)
         {
-            auto& cands = stream_itor->second->GetCandidates();
+            ICE::CandContainer cands;
+            stream_itor->second->GetCandidates(cands);
             auto compId = stream_itor->first;
-            const char* transport = SDPDEF::GetProtocolName(stream_itor->second->GetProtocol());
 
+            const char* transport = SDPDEF::GetProtocolName(stream_itor->second->GetProtocol());
             for (auto& cand_itor = cands.begin(); cand_itor != cands.end(); ++cand_itor)
             {
-                auto cand = cand_itor->first;
+                auto cand = *cand_itor;
                 /*
                 rfc5245
                 15.1.  "candidate" Attribute

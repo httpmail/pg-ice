@@ -353,7 +353,15 @@ namespace STUN {
     bool MessagePacket::SendData(ICE::Channel & channel)
     {
         Finalize();
-        return channel.Write(&m_StunPacket, m_AttrLength + sStunHeaderLength) > 0;
+        auto total_length = m_AttrLength + sStunHeaderLength;
+        return channel.Send(&m_StunPacket, m_AttrLength + sStunHeaderLength) ==  total_length;
+    }
+
+    bool MessagePacket::SendData(ICE::Channel & channel, const std::string & dest, uint16_t port)
+    {
+        Finalize();
+        auto total_length = m_AttrLength + sStunHeaderLength;
+        return channel.Send(&m_StunPacket, total_length, dest, port) == total_length;
     }
 
     const ATTR::MappedAddress* MessagePacket::GetAttribute(const ATTR::MappedAddress *& mapAddr) const
@@ -691,13 +699,13 @@ namespace STUN {
     }
 
 
-    SubBindResqMsg::SubBindResqMsg(const TransId & transId, const ATTR::XorMappedAddress& xormapAddr) :
+    SubBindRespMsg::SubBindRespMsg(const TransId & transId, const ATTR::XorMappedAddress& xormapAddr) :
         MessagePacket(STUN::MsgType::BindingResp, transId)
     {
         AddAttribute(xormapAddr);
     }
 
-    SubBindResqMsg::SubBindResqMsg(const PACKET::stun_packet & packet, uint16_t packet_size):
+    SubBindRespMsg::SubBindRespMsg(const PACKET::stun_packet & packet, uint16_t packet_size):
         MessagePacket(packet, packet_size)
     {
         assert(packet.MsgId() == MsgType::BindingResp);
@@ -718,7 +726,6 @@ namespace STUN {
     SubBindErrRespMsg::SubBindErrRespMsg(const PACKET::stun_packet & packet, uint16_t packet_size) :
         MessagePacket(packet, packet_size)
     {
-        AddErrorCode(4, 87, "unknown-attributes");
         assert(packet.MsgId() == MsgType::BindingErrResp);
     }
 

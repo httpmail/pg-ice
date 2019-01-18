@@ -50,6 +50,9 @@
     <ClCompile Include="src\ping.cpp">
       <Filter>pg</Filter>
     </ClCompile>
+    <ClCompile Include="inc\config.cpp">
+      <Filter>ice</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="inc\agent.h">
@@ -116,6 +119,9 @@
       <Filter>pg</Filter>
     </ClInclude>
     <ClInclude Include="inc\utility.h">
+      <Filter>ice</Filter>
+    </ClInclude>
+    <ClInclude Include="inc\config.h">
       <Filter>ice</Filter>
     </ClInclude>
   </ItemGroup>

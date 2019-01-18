@@ -11,6 +11,7 @@
 #include< windows.h> 
 #include <WS2tcpip.h>
 #include "stunmsg.h"
+#include "config.h"
 
 class Endpoint {
 public:
@@ -30,88 +31,62 @@ static std::condition_variable sCond;
 static bool bRecved = false;
 static std::string sOffer;
 
-
-void RecvThrd0(SOCKET* s)
-{
-    while (1)
-    {
-        char buf[1024];
-        memset(buf, 0, sizeof(buf));
-        auto bytes = recv(*s, buf, sizeof(buf), 0);
-        LOG_INFO("recvthrd0", "%s", buf);
-    }
-}
-
-
-void RecvThrd1(SOCKET* s)
-{
-    while (1)
-    {
-        char buf[1024];
-        memset(buf, 0, sizeof(buf));
-        auto bytes = recv(*s, buf, sizeof(buf), 0);
-        LOG_INFO("recvthrd1", "%s", buf);
-    }
-}
-
-class A1 {
-
-};
-
-class B1 : public A1 {
-
-};
-
-using C = std::set<B1*>;
 int main() 
 {
-    ICE::CAgentConfig config;
-    ICE::CAgent agent;
+#if 0
+    boost::asio::ip::address addr = boost::asio::ip::address::from_string(config.DefaultIP());
+    boost::asio::ip::tcp::socket s1(sIOService);
+    boost::asio::ip::tcp::endpoint ep2(addr, 10000);
 
+    boost::system::error_code error;
+
+    s1.open(ep2.protocol());
+    s1.bind(ep2);
+
+    //s1.shutdown(boost::asio::socket_base::shutdown_both, error);
+    s1.close();
+    if (error.value())
+    {
+       // return -1;
+    }
+
+    boost::asio::ip::tcp::socket s2(sIOService);
+    s2.open(ep2.protocol());
+    s2.bind(ep2,error);
+    if (error.value())
+    {
+        std::cout << "s2 failed" << std::endl;
+        return -1;
+    }
+#endif
+
+#if 0
     boost::asio::ip::tcp::socket s(sIOService);
 
-    boost::asio::ip::udp::socket s1(sIOService);
+    boost::asio::ip::address localAddress = boost::asio::ip::address::from_string(config.DefaultIP());
 
-    char mybuf[1024];
-    boost::asio::ip::udp::endpoint s1_ep;
-
-    boost::asio::ip::udp::endpoint s1_ep1(boost::asio::ip::address::from_string(config.DefaultIP()), 10000);
-
-    s1.open(s1_ep.protocol());
-    s1.bind(s1_ep1);
-    s1.receive_from(boost::asio::buffer(mybuf, sizeof(mybuf)), s1_ep);
-    boost::system::error_code ec;
-
-
-    config.AddStunServer("64.235.150.11",3478);
-    config.AddStunServer("216.93.246.18", 3478);
-
-    boost::asio::ip::address addr(boost::asio::ip::address::from_string("190.168.110.166"));
-    boost::asio::ip::address laddr(boost::asio::ip::address::from_string(config.DefaultIP()));
-
-    boost::asio::ip::tcp::endpoint ep(addr, 3478);
-
-    boost::asio::ip::tcp::endpoint local(laddr, 8888);
-    std::cout << local.port() << std::endl;
-    s.open(local.protocol());
-    s.bind(local, ec);
-
-    auto t1 = std::chrono::steady_clock::now();
-    s.connect(ep, ec);
-
-    auto take = std::chrono::duration_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now() - t1);
+    boost::asio::ip::tcp::endpoint serverEp(localAddress, 3478);
+    s.connect(serverEp);
 
     STUN::TransId id;
     STUN::MessagePacket::GenerateRFC5389TransationId(id);
-    STUN::FirstBindReqMsg msg(id);
+    STUN::FirstBindReqMsg reqMsg(id);
 
-    s.send(boost::asio::buffer(msg.GetData(), msg.GetLength()), 0);
-    std::thread
-    while (1);
-#if 0
+    s.send(boost::asio::buffer(reqMsg.GetData(), reqMsg.GetLength()));
+
+    char info[1024];
+    s.receive(boost::asio::buffer(info, sizeof(1024)));
+#endif
+
+    auto& config = Configuration::Instance();
+
+    config.AddStunServer("64.235.150.11",3478);
+    //config.AddStunServer("216.93.246.18", 3478);
+    //config.AddStunServer("192.168.110.123", 3478);
 
     Endpoint ep(config.DefaultIP());
-    ICE::Session session(config.DefaultIP());
+    ICE::Session session;
+
     ICE::MediaAttr videoMedia = {
         "video",
         {
@@ -127,8 +102,9 @@ int main()
             ICE::MediaAttr::StreamAttr{ ICE::Protocol::udp, 2, 10011, config.DefaultIP() },
         }
     };
+
     std::string offer;
-    if (session.CreateMedia(videoMedia, config))
+    if (session.CreateMedia(videoMedia))
     {
 
         if (session.MakeOffer(offer))
@@ -166,14 +142,15 @@ int main()
             LOG_ERROR("Exception", ":%s", e.what());
         }
 
-        session.ConnectivityCheck(sOffer,config);
+        session.ConnectivityCheck(sOffer);
 
     }
     else
     {
         assert(0);
     }
-#endif
+
+    while (1);
 }
 
 Endpoint::Endpoint(const std::string& ip) :
@@ -188,6 +165,8 @@ Endpoint::Endpoint(const std::string& ip) :
 
 Endpoint::~Endpoint()
 {
+    if (m_recv_thrd.joinable())
+        m_recv_thrd.join();
 }
 
 void Endpoint::RecvThread(Endpoint * pThis)

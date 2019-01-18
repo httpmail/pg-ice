@@ -1,5 +1,5 @@
-#include "media.h"
 
+#include "media.h"
 namespace {
     static const std::string BASE64 =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -44,68 +44,29 @@ namespace ICE {
         return itor != m_Streams.end() ? itor->second : nullptr;
     }
 
-    bool Media::CreateStream(uint8_t compId, Protocol protocol, const std::string & hostIP, uint16_t port, const CAgentConfig& config)
+    bool Media::CreateStream(uint8_t compId, Protocol protocol, const std::string& hostIP, uint16_t hostPort)
     {
-#if 0
-        class EventHelper : public PG::CListener {
-        public:
-            EventHelper(Media* pOwner, Stream* pStream) :
-                m_pOwner(pOwner), m_pStream(pStream)
-            {
-                assert(pOwner && pStream);
-            }
 
-            virtual ~EventHelper()
-            {
-            }
-
-            void OnEventFired(PG::MsgEntity * pSender, PG::MsgEntity::MSG_ID msg_id, PG::MsgEntity::WPARAM wParam, PG::MsgEntity::LPARAM lParam) override
-            {
-                assert(static_cast<Stream::Message>(msg_id) == Stream::Message::Gathering && wParam == (PG::MsgEntity::WPARAM)m_pStream);
-                m_bResult = lParam > 0;
-                std::unique_lock<decltype(m_Mutex)> locker(m_Mutex);
-                m_Cond.notify_one();
-            }
-
-            bool WaitResult()
-            {
-                std::unique_lock<decltype(m_Mutex)> locker(m_Mutex);
-                m_Cond.wait(locker);
-                return m_bResult;
-            }
-
-        private:
-            Media   *m_pOwner;
-            Stream  *m_pStream;
-            bool     m_bResult;
-            std::condition_variable m_Cond;
-            std::mutex              m_Mutex;
-        };
-
-        std::auto_ptr<Stream> stream(new Stream(compId, protocol, 0xFFFF, hostIP, port));
+        std::auto_ptr<Stream> stream(new Stream(compId, protocol, hostIP, hostPort));
         if (!stream.get())
         {
             LOG_ERROR("Media", "Not enough to Create Stream failed");
             return false;
         }
 
-        EventHelper helper(this, stream.get());
-        if (!stream->RegisterEventListener(static_cast<uint16_t>(Stream::Message::Gathering), &helper) ||
-            !stream->GatheringCandidate(config))
+        if(!stream->GatherCandidate())
+        {
+            LOG_ERROR("Media", "Create Stream Failed to gather candidates");
+            return false;
+        }
+
+        if (!m_Streams.insert(std::make_pair(compId, stream.get())).second)
         {
             LOG_ERROR("Media", "Create Stream Failed");
             return false;
         }
 
-        if (!helper.WaitResult() || !m_Streams.insert(std::make_pair(compId, stream.get())).second)
-        {
-            LOG_ERROR("Media", "Create Stream Failed 1");
-            return false;
-        }
-
-        stream->UnregisterEventListenner(static_cast<uint16_t>(Stream::Message::Gathering), &helper);
         stream.release();
-#endif
         return true;
     }
 }

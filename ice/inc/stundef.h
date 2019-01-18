@@ -170,14 +170,14 @@ namespace STUN {
                 Header(id, 8)
             {}
 
-            int16_t Port() const
+            uint16_t Port() const
             {
-                return PG::network_to_host(m_Port);
+                return PG::network_to_host<uint16_t>(m_Port);
             }
 
-            void Port(int16_t port)
+            void Port(uint16_t port)
             {
-                m_Port = PG::host_to_network(port);
+                m_Port = PG::host_to_network<uint16_t>(port);
             }
 
             uint32_t Address() const
@@ -343,11 +343,6 @@ namespace STUN {
                 Header(Id::ErrorCode, 0)
             {}
 
-            uint32_t Class() const
-            {
-                return m_Class;
-            }
-
             void Class(uint16_t classCode)
             {
                 assert(classCode >= 3 && classCode <= 6);
@@ -355,16 +350,13 @@ namespace STUN {
                 m_Class = classCode;
             }
 
-            uint32_t Number() const
-            {
-                return m_Number;
-            }
-
             void Number(uint16_t number)
             {
                 assert(number >= 0 && number <= 99);
                 m_Number = number;
             }
+
+            uint16_t Code() const { return m_Class * 100 + m_Number; }
 
             void Reason(const std::string& reason)
             {

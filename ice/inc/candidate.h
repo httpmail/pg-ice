@@ -2,7 +2,7 @@
 
 #include <stdint.h>
 #include <string>
-#include <unordered_set>
+#include <set>
 #include <assert.h>
 
 #include "streamdef.h"
@@ -111,7 +111,6 @@ namespace ICE {
         {}
     };
 
-
     class CandidatePeer {
     public:
         CandidatePeer::CandidatePeer(uint64_t PRI, const ICE::Candidate& lcand, const ICE::Candidate &rcand) :
@@ -153,5 +152,6 @@ namespace ICE {
         const Candidate &m_RCand;
     };
 
-    using CandPeerContainer = std::unordered_set<CandidatePeer*>;
+    using CandPeerContainer = std::set<CandidatePeer>;
+    using CandContainer     = std::vector<const Candidate*>;
 }

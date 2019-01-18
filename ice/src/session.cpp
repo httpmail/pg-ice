@@ -4,6 +4,7 @@
 #include "stream.h"
 #include "sdp.h"
 #include "candidate.h"
+#include "config.h"
 
 #include "pg_log.h"
 
@@ -13,11 +14,12 @@
 
 namespace {
     using namespace ICE;
-    void FormingCandidatePairs(Session::CandPeerContainer& candPeers, const ICE::Stream::CandsContainer& lcandscontainer, const CSDP::RemoteMedia::CandContainer &rcandscontainer, bool bControlling)
+
+     void FormingCandidatePairs(CandPeerContainer& candPeers, const CandContainer &lcandscontainer, const CandContainer &rcandscontainer, bool bControlling)
     {
         for (auto lcands_itor = lcandscontainer.begin(); lcands_itor != lcandscontainer.end(); ++lcands_itor)
         {
-            auto lcand = lcands_itor->first;
+            auto lcand = *lcands_itor;
             assert(lcand);
             for (auto rcands_itor = rcandscontainer.begin(); rcands_itor != rcandscontainer.end(); ++rcands_itor)
             {
@@ -52,8 +54,8 @@ namespace {
                         their local candidates have the same base and their remote candidates
                         are identical
                          */
-                        auto peer_lcand = peer_itor->LCandidate();
-                        auto peer_rcand = peer_itor->RCandidate();
+                        auto& peer_lcand = (peer_itor)->LCandidate();
+                        auto& peer_rcand = (peer_itor)->RCandidate();
                         if ((lcand->m_BaseIP == peer_lcand.m_BaseIP && lcand->m_BasePort == peer_lcand.m_BasePort) &&
                             (rcand->m_ConnIP == peer_rcand.m_ConnIP && rcand->m_ConnPort == peer_rcand.m_ConnPort))
                         {
@@ -74,8 +76,10 @@ namespace {
 }
 
 namespace ICE {
-    Session::Session(const std::string& defaultIP) :
-        m_Config(PG::GenerateRandom64(), defaultIP)
+    Session::Session(const std::string& sessionName, const std::string& userName) :
+        m_Tiebreaker(PG::GenerateRandom64()),
+        m_DefaultIP(Configuration::Instance().DefaultIP()),
+        m_Username(userName), m_SessionName(sessionName)
     {
     }
 
@@ -83,7 +87,7 @@ namespace ICE {
     {
     }
 
-    bool Session::CreateMedia(const MediaAttr& mediaAttr, const CAgentConfig& config)
+    bool Session::CreateMedia(const MediaAttr& mediaAttr)
     {
         if (m_Medias.end() != m_Medias.find(mediaAttr.m_Name))
         {
@@ -101,7 +105,7 @@ namespace ICE {
 
         for (auto itor = mediaAttr.m_StreamAttrs.begin(); itor != mediaAttr.m_StreamAttrs.end(); ++itor)
         {
-            if (!media->CreateStream(itor->m_CompId, itor->m_Protocol, itor->m_HostIP, itor->m_HostPort, config))
+            if (!media->CreateStream(itor->m_CompId, itor->m_Protocol, itor->m_HostIP, itor->m_HostPort))
             {
                 LOG_ERROR("Session", "Media [%s] Create Stream failed [%d] [%s:%d]", mediaAttr.m_Name, itor->m_CompId, itor->m_HostIP.c_str(), itor->m_HostPort);
                 return false;
@@ -118,7 +122,7 @@ namespace ICE {
         return true;
     }
 
-    bool Session::ConnectivityCheck(const std::string & offer, const CAgentConfig& config)
+    bool Session::ConnectivityCheck(const std::string & offer)
     {
         CSDP sdp;
 
@@ -142,6 +146,7 @@ namespace ICE {
                 LOG_ERROR("Session", "remote media has no [%s]", lmedia_itor->first.c_str());
                 return false;
             }
+
             auto lmedia = lmedia_itor->second;
 
             assert(lmedia);
@@ -158,6 +163,7 @@ namespace ICE {
                     LOG_ERROR("Session", "remote [%s] media has no [%d] component", lstream->ComponentId(), lmedia_itor->first.c_str());
                     return false;
                 }
+
                 std::auto_ptr<CandPeerContainer> candPeerContainer(new CandPeerContainer);
 
                 if (!candPeerContainer.get())
@@ -167,7 +173,12 @@ namespace ICE {
                 }
 
                 assert(rcand_itor->second);
-                FormingCandidatePairs(*candPeerContainer.get(), lstream->GetCandidates(), *rcand_itor->second, m_Config.IsControlling());
+
+                CandContainer lcands, rcands;
+                lstream->GetCandidates(lcands);
+                rcands.assign(rcand_itor->second->begin(), rcand_itor->second->end());
+
+                FormingCandidatePairs(*candPeerContainer.get(), lcands, rcands, m_bControlling);
                 if (candPeerContainer->empty())
                 {
                     LOG_ERROR("Session", "[%s] media has no candidate peers", lmedia_itor->first.c_str());
@@ -196,7 +207,7 @@ namespace ICE {
             }
         }
 
-        if (total_cand_pairs == 0 || total_cand_pairs > config.CandPairsLimits())
+        if (total_cand_pairs == 0 || total_cand_pairs > Configuration::Instance().CandPairsLimits())
         {
             LOG_ERROR("Session", "too much candidate pairs [%d]", total_cand_pairs);
             std::for_each(m_CheckList.begin(), m_CheckList.end(), [](auto &elem) {
@@ -211,17 +222,15 @@ namespace ICE {
             auto stream = check_itor->first.m_pStream;
             assert(stream && check_itor->second);
 
-            for (auto cand_peer_itor = check_itor->second->begin(); cand_peer_itor != check_itor->second->end(); ++cand_peer_itor)
-            {
-                auto lcand = cand_peer_itor->LCandidate();
-                auto rcand = cand_peer_itor->RCandidate();
+            if (!stream->ConnectivityCheck(m_bControlling, *check_itor->second, 
+                UTILITY::AuthInfo(check_itor->first.m_LPwd,check_itor->first.m_LUfrag),
+                UTILITY::AuthInfo(check_itor->first.m_RPwd, check_itor->first.m_RUfrag)))
+                continue;
 
-                if (!stream->ConnectivityCheck(&lcand, &rcand, m_Config.TieBreaker(), m_Config.IsControlling(),
-                    check_itor->first.m_LPwd, check_itor->first.m_RPwd, check_itor->first.m_LUfrag, check_itor->first.m_RUfrag))
-                    continue;
-                std::this_thread::sleep_for(std::chrono::milliseconds(config.Ta()));
-            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(Configuration::Instance().Ta()));
         }
+
+        return true;
     }
 
     bool Session::MakeOffer(std::string & offer)
