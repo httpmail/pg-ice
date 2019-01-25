@@ -26,9 +26,6 @@
     <ClCompile Include="src\stunmsg.cpp">
       <Filter>ice</Filter>
     </ClCompile>
-    <ClCompile Include="src\stunprotocol.cpp">
-      <Filter>ice</Filter>
-    </ClCompile>
     <ClCompile Include="..\pg\inc\pg_buffer.cpp">
       <Filter>pg</Filter>
     </ClCompile>
@@ -83,9 +80,6 @@
       <Filter>ice</Filter>
     </ClInclude>
     <ClInclude Include="inc\stunmsg.h">
-      <Filter>ice</Filter>
-    </ClInclude>
-    <ClInclude Include="inc\stunprotocol.h">
       <Filter>ice</Filter>
     </ClInclude>
     <ClInclude Include="inc\icmp_header.h">

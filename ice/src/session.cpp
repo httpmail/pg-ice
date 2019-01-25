@@ -79,7 +79,8 @@ namespace ICE {
     Session::Session(const std::string& sessionName, const std::string& userName) :
         m_Tiebreaker(PG::GenerateRandom64()),
         m_DefaultIP(Configuration::Instance().DefaultIP()),
-        m_Username(userName), m_SessionName(sessionName)
+        m_Username(userName), m_SessionName(sessionName),
+        m_bControlling(true)
     {
     }
 

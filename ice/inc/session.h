@@ -44,6 +44,7 @@ namespace ICE {
         Session(const std::string& sessionName = "-", const std::string& userName = "-");
         virtual ~Session();
 
+        void SetControlling(bool bControlling = true) { m_bControlling = bControlling; }
         bool CreateMedia(const MediaAttr& mediaAttr);
         bool ConnectivityCheck(const std::string& offer);
         bool MakeOffer(std::string& offer);

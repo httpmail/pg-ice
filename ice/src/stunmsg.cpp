@@ -64,6 +64,54 @@ namespace STUN {
         }
     }
 
+    void MessagePacket::Finalize(MessagePacket & packet, const std::string & pwd)
+    {
+        auto& attributes = packet.m_Attributes;
+        if (attributes.find(ATTR::Id::MessageIntegrity) != attributes.end())
+            return;
+
+        SHA1 sha1;
+        /*
+        RFC8445 [15.4]
+        */
+        packet.m_StunPacket.Length(packet.m_AttrLength + STUN::sSHA1Size + sizeof(ATTR::Header));
+        CalcHmacSha1(pwd, reinterpret_cast<const uint8_t*>(&packet.m_StunPacket), packet.m_AttrLength + STUN::sStunHeaderLength, sha1);
+
+        auto pBuf = packet.AllocAttribute(STUN::ATTR::Id::MessageIntegrity, sizeof(ATTR::MessageIntegrity));
+        assert(pBuf);
+
+        reinterpret_cast<uint16_t*>(pBuf)[0] = PG::host_to_network(static_cast<uint16_t>(ATTR::Id::MessageIntegrity));
+        reinterpret_cast<uint16_t*>(pBuf)[1] = PG::host_to_network(static_cast<uint16_t>(STUN::sSHA1Size));
+
+
+
+        auto pMsgIntegrity = reinterpret_cast<ATTR::MessageIntegrity*>(pBuf);
+        pMsgIntegrity->SHA1(sha1);
+
+        /*
+        RFC5389 [15.5.  FINGERPRINT]
+        The FINGERPRINT attribute MAY be present in all STUN messages.  The
+        value of the attribute is computed as the CRC-32 of the STUN message
+        up to (but excluding) the FINGERPRINT attribute itself, XOR'ed with
+        the 32-bit value 0x5354554e
+        */
+
+        boost::crc_32_type crc32_result;
+        crc32_result.process_bytes(&packet.m_StunPacket, packet.m_AttrLength + STUN::sStunHeaderLength);
+        uint32_t crc32 = crc32_result.checksum() ^ sStunXorFingerprint;
+
+        // add fingerprint to packet
+        pBuf = packet.AllocAttribute(STUN::ATTR::Id::Fingerprint, sizeof(ATTR::Fingerprint));
+        assert(pBuf);
+        reinterpret_cast<uint16_t*>(pBuf)[0] = PG::host_to_network(static_cast<uint16_t>(ATTR::Id::Fingerprint));
+        reinterpret_cast<uint16_t*>(pBuf)[1] = PG::host_to_network(static_cast<uint16_t>(sizeof(ATTR::Fingerprint) - sizeof(ATTR::Header)));
+
+        auto pFigerprint = reinterpret_cast<ATTR::Fingerprint*>(pBuf);
+        pFigerprint->CRC32(crc32);
+
+        packet.m_StunPacket.Length(packet.m_AttrLength);
+    }
+
     void MessagePacket::AddAttribute(const ATTR::Priority &attr)
     {
         if (HasAttribute(attr.Type()))
@@ -114,6 +162,7 @@ namespace STUN {
             {
                 ATTR::Id id = static_cast<ATTR::Id>(PG::network_to_host(reinterpret_cast<const uint16_t*>(&attr[i])[0]));
                 attr_len    = CalcPaddingSize(PG::network_to_host(reinterpret_cast<const uint16_t*>(&attr[i])[1]));
+
                 switch (id)
                 {
                 case STUN::ATTR::Id::MappedAddress:
@@ -129,8 +178,8 @@ namespace STUN {
                 case STUN::ATTR::Id::ReflectedFrom:
                 case STUN::ATTR::Id::Realm:
                 case STUN::ATTR::Id::Nonce:
-                case STUN::ATTR::Id::XorMappedAddress:
-                case STUN::ATTR::Id::XorMappedAdd:
+                case STUN::ATTR::Id::XorMapped:
+                case STUN::ATTR::Id::XorMappedSvr:
                 case STUN::ATTR::Id::Software:
                 case STUN::ATTR::Id::AlternateServer:
                 case STUN::ATTR::Id::Priority:
@@ -154,17 +203,17 @@ namespace STUN {
         }
     }
 
-    void MessagePacket::AddAttribute(const ATTR::MappedAddress &attr)
+    void MessagePacket::AddAttribute(const ATTR::Address32 & attr)
     {
         if (HasAttribute(attr.Type()))
         {
-            LOG_WARNING("STUN-MSG", "MappedAddress[%d] attribute already existed!", attr.Type());
+            LOG_WARNING("STUN-MSG", "Address [%d] attribute already existed!", attr.Type());
             return;
         }
 
-        static_assert(sizeof(ATTR::MappedAddress) == 12, "MappedAddress MUST be 12 bytes");
+        static_assert(sizeof(ATTR::Address32) == 12, "address attribute MUST be 12 bytes");
 
-        auto pBuf = AllocAttribute(attr.Type(), sizeof(ATTR::MappedAddress));
+        auto pBuf = AllocAttribute(attr.Type(), sizeof(ATTR::Address32));
         if (!pBuf)
         {
             LOG_ERROR("STUN-MSG", "Not enough memory for Attribute [%d]", attr.Type());
@@ -172,9 +221,30 @@ namespace STUN {
         }
 
         const uint8_t* source = reinterpret_cast<const uint8_t*>(&attr);
+        reinterpret_cast<uint64_t*>(pBuf)[0] = reinterpret_cast<const uint64_t*>(source)[0];
+        reinterpret_cast<uint32_t*>(&pBuf[8])[0] = reinterpret_cast<const uint32_t*>(&source[8])[0];
+    }
 
-        reinterpret_cast<uint64_t*>(pBuf)[0]     = reinterpret_cast<const uint64_t*>(source)[0];
-        reinterpret_cast<uint32_t*>(&pBuf[4])[0] = reinterpret_cast<const uint32_t*>(&source[4])[0];
+    void MessagePacket::AddAttribute(const ATTR::XorMapped32 & attr)
+    {
+        if (HasAttribute(attr.Type()))
+        {
+            LOG_WARNING("STUN-MSG", "XorMapped32 [%d] attribute already existed!", attr.Type());
+            return;
+        }
+
+        static_assert(sizeof(ATTR::Address32) == 12, "XorMapped32 attribute MUST be 12 bytes");
+
+        auto pBuf = AllocAttribute(attr.Type(), sizeof(ATTR::Address32));
+        if (!pBuf)
+        {
+            LOG_ERROR("STUN-MSG", "Not enough memory for Attribute [%d]", attr.Type());
+            return;
+        }
+
+        const uint8_t* source = reinterpret_cast<const uint8_t*>(&attr);
+        reinterpret_cast<uint64_t*>(pBuf)[0] = reinterpret_cast<const uint64_t*>(source)[0];
+        reinterpret_cast<uint32_t*>(&pBuf[8])[0] = reinterpret_cast<const uint32_t*>(&source[8])[0];
     }
 
     void MessagePacket::AddAttribute(const ATTR::ChangeRequest & attr)
@@ -195,29 +265,6 @@ namespace STUN {
         }
 
         reinterpret_cast<uint64_t*>(pBuf)[0] = reinterpret_cast<const uint64_t*>(&attr)[0];
-    }
-
-    void MessagePacket::AddAttribute(const ATTR::XorMappedAddress &attr)
-    {
-        static_assert(sizeof(ATTR::XorMappedAddress) == 12, "XorMappedAddress Must Be 12 Bytes");
-
-        if (HasAttribute(attr.Type()))
-        {
-            LOG_WARNING("STUN-MSG", "XorMappedAddress attributes already existed!");
-            return;
-        }
-
-        auto pBuf = AllocAttribute(attr.Type(), sizeof(ATTR::XorMappedAddress));
-
-        if (!pBuf)
-        {
-            LOG_ERROR("STUN-MSG", "Not enough memory for XorMappedAddress");
-            return;
-        }
-
-        const uint8_t* source = reinterpret_cast<const uint8_t*>(&attr);
-        reinterpret_cast<uint64_t*>(pBuf)[0] = reinterpret_cast<const uint64_t*>(source)[0];
-        reinterpret_cast<uint32_t*>(&pBuf[4])[0] = reinterpret_cast<const uint32_t*>(&source[4])[0];
     }
 
     void MessagePacket::AddAttribute(const ATTR::Role &attr)
@@ -350,18 +397,16 @@ namespace STUN {
         reinterpret_cast<uint64_t*>(&id)[1] = PG::host_to_network(PG::GenerateRandom64());
     }
 
-    bool MessagePacket::SendData(ICE::Channel & channel)
+    int32_t MessagePacket::SendData(ICE::Channel & channel)
     {
         Finalize();
-        auto total_length = m_AttrLength + sStunHeaderLength;
-        return channel.Send(&m_StunPacket, m_AttrLength + sStunHeaderLength) ==  total_length;
+        return channel.Send(&m_StunPacket, m_AttrLength + sStunHeaderLength);
     }
 
-    bool MessagePacket::SendData(ICE::Channel & channel, const std::string & dest, uint16_t port)
+    int32_t MessagePacket::SendData(ICE::Channel & channel, const std::string & dest, uint16_t port)
     {
         Finalize();
-        auto total_length = m_AttrLength + sStunHeaderLength;
-        return channel.Send(&m_StunPacket, total_length, dest, port) == total_length;
+        return channel.Send(&m_StunPacket, m_AttrLength + sStunHeaderLength, dest, port);
     }
 
     const ATTR::MappedAddress* MessagePacket::GetAttribute(const ATTR::MappedAddress *& mapAddr) const
@@ -373,11 +418,11 @@ namespace STUN {
         return mapAddr;
     }
 
-    const ATTR::XorMappedAddr* MessagePacket::GetAttribute(const ATTR::XorMappedAddr *& mapAddr) const
+    const ATTR::XorMappAddress* MessagePacket::GetAttribute(const ATTR::XorMappAddress *& mapAddr) const
     {
-        auto itor = m_Attributes.find(ATTR::Id::XorMappedAdd);
+        auto itor = m_Attributes.find(ATTR::Id::XorMapped);
         mapAddr = (itor == m_Attributes.end()) ?
-            nullptr : reinterpret_cast<const ATTR::XorMappedAddr*>(&m_StunPacket.Attributes()[itor->second]);
+            nullptr : reinterpret_cast<const ATTR::XorMappAddress*>(&m_StunPacket.Attributes()[itor->second]);
 
         return mapAddr;
     }
@@ -391,11 +436,11 @@ namespace STUN {
         return changeReq;
     }
 
-    const ATTR::XorMappedAddress* MessagePacket::GetAttribute(const ATTR::XorMappedAddress *& xorMap) const
+    const ATTR::XorMappedAddrSvr* MessagePacket::GetAttribute(const ATTR::XorMappedAddrSvr *& xorMap) const
     {
-        auto itor = m_Attributes.find(ATTR::Id::XorMappedAddress);
+        auto itor = m_Attributes.find(ATTR::Id::XorMappedSvr);
         xorMap = (itor == m_Attributes.end()) ?
-            nullptr : reinterpret_cast<const ATTR::XorMappedAddress*>(&m_StunPacket.Attributes()[itor->second]);
+            nullptr : reinterpret_cast<const ATTR::XorMappedAddrSvr*>(&m_StunPacket.Attributes()[itor->second]);
 
         return xorMap;
     }
@@ -601,7 +646,7 @@ namespace STUN {
         auto content_length = packet.Length();
 
         // content length always padding to 4 bytes
-        if ( 0 != (content_length & 0x03) || (content_length + sStunHeaderLength != packet_size))
+        if (0 != (content_length & 0x03) || (content_length + sStunHeaderLength != packet_size))
             return false;
 
         // packet has magicCookie
@@ -647,60 +692,20 @@ namespace STUN {
         assert(packet.MsgId() == MsgType::BindingRequest);
     }
 
+    SubBindReqMsg::~SubBindReqMsg()
+    {
+        int i = 0;
+        ++i;
+    }
+
     void SubBindReqMsg::Finalize()
     {
-        if (m_Attributes.find(ATTR::Id::MessageIntegrity) != m_Attributes.end())
-        {
-            return;
-        }
-
-        assert(m_Attributes.find(ATTR::Id::Fingerprint) == m_Attributes.end());
-
-        SHA1 sha1;
-        /*
-        RFC8445 [15.4]
-        */
-        m_StunPacket.Length(m_AttrLength + STUN::sSHA1Size + sizeof(ATTR::Header));
-        CalcHmacSha1(m_IcePwd, reinterpret_cast<const uint8_t*>(&m_StunPacket), m_AttrLength + STUN::sStunHeaderLength, sha1);
-
-        auto pBuf = AllocAttribute(STUN::ATTR::Id::MessageIntegrity, sizeof(ATTR::MessageIntegrity));
-        assert(pBuf);
-
-        reinterpret_cast<uint16_t*>(pBuf)[0] = PG::host_to_network(static_cast<uint16_t>(ATTR::Id::MessageIntegrity));
-        reinterpret_cast<uint16_t*>(pBuf)[1] = PG::host_to_network(static_cast<uint16_t>(STUN::sSHA1Size));
-
-
-
-        auto pMsgIntegrity = reinterpret_cast<ATTR::MessageIntegrity*>(pBuf);
-        pMsgIntegrity->SHA1(sha1);
-
-        /*
-        RFC5389 [15.5.  FINGERPRINT]
-        The FINGERPRINT attribute MAY be present in all STUN messages.  The
-        value of the attribute is computed as the CRC-32 of the STUN message
-        up to (but excluding) the FINGERPRINT attribute itself, XOR'ed with
-        the 32-bit value 0x5354554e
-        */
-
-        boost::crc_32_type crc32_result;
-        crc32_result.process_bytes(&m_StunPacket, m_AttrLength + STUN::sStunHeaderLength);
-        uint32_t crc32 = crc32_result.checksum() ^ sStunXorFingerprint;
-
-        // add fingerprint to packet
-        pBuf = AllocAttribute(STUN::ATTR::Id::Fingerprint, sizeof(ATTR::Fingerprint));
-        assert(pBuf);
-        reinterpret_cast<uint16_t*>(pBuf)[0] = PG::host_to_network(static_cast<uint16_t>(ATTR::Id::Fingerprint));
-        reinterpret_cast<uint16_t*>(pBuf)[1] = PG::host_to_network(static_cast<uint16_t>(sizeof(ATTR::Fingerprint) - sizeof(ATTR::Header)));
-
-        auto pFigerprint = reinterpret_cast<ATTR::Fingerprint*>(pBuf);
-        pFigerprint->CRC32(crc32);
-
-        m_StunPacket.Length(m_AttrLength);
+        MessagePacket::Finalize(*this, m_IcePwd);
     }
 
 
-    SubBindRespMsg::SubBindRespMsg(const TransId & transId, const ATTR::XorMappedAddress& xormapAddr) :
-        MessagePacket(STUN::MsgType::BindingResp, transId)
+    SubBindRespMsg::SubBindRespMsg(const TransId & transId, const ATTR::XorMappAddress& xormapAddr, const std::string& pwd) :
+        MessagePacket(STUN::MsgType::BindingResp, transId), m_pwd(pwd)
     {
         AddAttribute(xormapAddr);
     }
@@ -709,6 +714,11 @@ namespace STUN {
         MessagePacket(packet, packet_size)
     {
         assert(packet.MsgId() == MsgType::BindingResp);
+    }
+
+    void SubBindRespMsg::Finalize()
+    {
+        MessagePacket::Finalize(*this, m_pwd);
     }
 
     SubBindErrRespMsg::SubBindErrRespMsg(TransIdConstRef id, uint8_t classCode, uint8_t number, const std::string & reason) :
@@ -729,5 +739,8 @@ namespace STUN {
         assert(packet.MsgId() == MsgType::BindingErrResp);
     }
 
+    void SubBindErrRespMsg::Finalize()
+    {
+    }
 }
 

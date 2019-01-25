@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <unordered_map>
+#include <queue>
 #include <assert.h>
 
 #include "candidate.h"
@@ -133,9 +134,6 @@ namespace ICE {
         std::mutex              m_TaMutex;
         std::condition_variable m_TaCond;
 
-        CheckSessionContainer   m_CheckSessions;
-        CheckSessionSubscriber  m_CheckSubscriber;
-
         UTILITY::AuthInfo       m_LocalAuthInfo;
         UTILITY::AuthInfo       m_RemoteAuthInfo;
         uint64_t                m_TieBreaker;
@@ -147,7 +145,7 @@ namespace ICE {
         bool                    m_bControlling;
 
     private:
-        static const int16_t    m_MaxTries = 5;
+        static const int16_t         m_MaxTries = 5;
         static const TimeOutInterval sUDPTimeoutInterval;
         static const TimeOutInterval sTCPTimeoutInterval;
         static const char*           sTransportProtocol;

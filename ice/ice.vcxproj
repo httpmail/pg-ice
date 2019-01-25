@@ -172,7 +172,6 @@
     <ClInclude Include="inc\streamdef.h" />
     <ClInclude Include="inc\stundef.h" />
     <ClInclude Include="inc\stunmsg.h" />
-    <ClInclude Include="inc\stunprotocol.h" />
     <ClInclude Include="inc\utility.h" />
   </ItemGroup>
   <ItemGroup>
@@ -193,7 +192,6 @@
     <ClCompile Include="src\session.cpp" />
     <ClCompile Include="src\stream.cpp" />
     <ClCompile Include="src\stunmsg.cpp" />
-    <ClCompile Include="src\stunprotocol.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

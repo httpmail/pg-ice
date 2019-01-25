@@ -54,6 +54,7 @@ namespace STUN {
     enum class MsgType : uint16_t {
         InvalidMsg      = 0x0000,
         BindingRequest  = 0x0001,
+        BindingIndicate = 0x0011,
         BindingResp     = 0x0101,
         BindingErrResp  = 0x0111,
         SSRequest       = 0x0002,
@@ -105,9 +106,9 @@ namespace STUN {
             Realm = 0x0014,
             Nonce = 0x0015,
 
-            XorMappedAddress = 0x0020,
+            XorMapped = 0x0020,
 
-            XorMappedAdd = 0x8020, /* stun server used 8020 instead of 0x0020 which defined in RFC5389 */
+            XorMappedSvr = 0x8020, /* stun server used 8020 instead of 0x0020 which defined in RFC5389 */
             Software = 0x8022,
             AlternateServer = 0x8023,
             Priority = 0x0024, /* RFC8445 16.1 */
@@ -164,48 +165,28 @@ namespace STUN {
         |                                                               |
         +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
         */
-        class MappedAddress : public Header {
+        class Address32 : public Header {
         public:
-            MappedAddress(Id id = Id::MappedAddress) :
-                Header(id, 8)
-            {}
+            Address32(Id id) : Header(id, 8), m_Reserved(0), m_Family(static_cast<decltype(m_Family)>(AddressFamily::IPv4)){}
+            ~Address32() {}
 
-            uint16_t Port() const
-            {
-                return PG::network_to_host<uint16_t>(m_Port);
-            }
+            uint16_t Port() const    { return PG::network_to_host<uint16_t>(m_Port); }
+            void Port(uint16_t port) { m_Port = PG::host_to_network<uint16_t>(port); }
 
-            void Port(uint16_t port)
-            {
-                m_Port = PG::host_to_network<uint16_t>(port);
-            }
+            uint32_t Address() const { return PG::network_to_host<uint32_t>(m_Address);}
+            void Address(uint32_t address) { m_Address = PG::host_to_network<uint32_t>(address); }
 
-            uint32_t Address() const
-            {
-                return PG::network_to_host(m_Address);
-            }
+            std::string IP() const { return boost::asio::ip::address_v4(Address()).to_string(); }
+        protected:
+            unsigned m_Reserved : 8;
+            unsigned m_Family   : 8;
+            unsigned m_Port     : 16;
+            unsigned m_Address  : 32;
+        };
 
-            std::string IP() const
-            {
-                boost::asio::ip::address_v4 address(Address());
-                return address.to_string();
-            }
-
-            void Address(uint32_t address)
-            {
-                m_Address = PG::host_to_network(m_Address);
-            }
-
-            AddressFamily Family() const
-            {
-                return  static_cast<AddressFamily>(m_Family);
-            }
-
-        private:
-            unsigned : 8;
-            unsigned m_Family : 8;
-            unsigned m_Port :   16;
-            unsigned m_Address : 32;
+        class MappedAddress : public Address32 {
+        public:
+            MappedAddress(Id id = Id::MappedAddress) : Address32(Id::MappedAddress) {}
         };
 
         class ResponseAddress : public MappedAddress {
@@ -447,102 +428,33 @@ namespace STUN {
             uint8_t m_Nonce[0];
         };
 
-        class XorMappedAddr : public Header{
+        class XorMapped32 : public Header{
         public:
-            XorMappedAddr() :
-                Header(Id::XorMappedAdd, 4)
-            {}
+            XorMapped32(Id id) : Header(id, 8), m_Reserved(0), m_Family(static_cast<decltype(m_Family)>(AddressFamily::IPv4)) {}
+            ~XorMapped32() {}
 
-            uint16_t Port() const
-            {
-                return static_cast<uint16_t>((sMagicCookie >> 16) ^ PG::network_to_host(static_cast<uint16_t>(m_Port)));
-            }
+            uint16_t Port() const { return static_cast<uint16_t>((sMagicCookie >> 16) ^ PG::network_to_host<uint16_t>(m_Port)); }
+            void Port(uint16_t port) { m_Port = PG::host_to_network<uint16_t>(port ^ (sMagicCookie >> 16)); }
 
-            void Port(int16_t port)
-            {
-                m_Port = PG::host_to_network(static_cast<uint16_t>(port ^ (sMagicCookie >> 16)));
-            }
+            uint32_t Address() const { return static_cast<int32_t>(sMagicCookie ^ PG::network_to_host<uint32_t>(m_Address)); }
+            void Address(uint32_t address) { m_Address = PG::host_to_network<uint32_t>(address ^ sMagicCookie); }
+            std::string IP() const { return boost::asio::ip::address_v4(Address()).to_string(); }
 
-            uint32_t Address() const
-            {
-                return static_cast<int32_t>(sMagicCookie ^ PG::network_to_host(static_cast<uint32_t>(m_Address)));
-            }
-
-            std::string IP() const
-            {
-                boost::asio::ip::address_v4 address(Address());
-                return address.to_string();
-            }
-
-            void Address(uint32_t address)
-            {
-                m_Address = PG::host_to_network(address ^ sMagicCookie);
-            }
-
-            AddressFamily Family() const
-            {
-                return  static_cast<AddressFamily>(m_Family);
-            }
-
-            const uint8_t* RawData() const
-            {
-                return reinterpret_cast<const uint8_t*>(this);
-            }
-
-        private:
-            unsigned : 8;
+        protected:
+            unsigned m_Reserved : 8;
             unsigned m_Family : 8;
             unsigned m_Port : 16;
             unsigned m_Address : 32;
         };
 
-        class XorMappedAddress : public Header {
+        class XorMappedAddrSvr : public XorMapped32 {
         public:
-            XorMappedAddress() :
-                Header(Id::XorMappedAddress, 4)
-            {}
+            XorMappedAddrSvr() : XorMapped32(Id::XorMappedSvr) {}
+        };
 
-            uint16_t Port() const
-            {
-                return static_cast<uint16_t>((sMagicCookie >> 16) ^ PG::network_to_host(static_cast<uint16_t>(m_Port)));
-            }
-
-            void Port(int16_t port)
-            {
-                m_Port = PG::host_to_network(static_cast<uint16_t>(port ^ (sMagicCookie >> 16)));
-            }
-
-            uint32_t Address() const
-            {
-                return static_cast<int32_t>(sMagicCookie ^ PG::network_to_host(static_cast<uint32_t>(m_Address)));
-            }
-
-            std::string IP() const
-            {
-                boost::asio::ip::address_v4 address(Address());
-                return address.to_string();
-            }
-
-            void Address(uint32_t address)
-            {
-                m_Address = PG::host_to_network(address ^ sMagicCookie);
-            }
-
-            AddressFamily Family() const
-            {
-                return  static_cast<AddressFamily>(m_Family);
-            }
-
-            const uint8_t* RawData() const
-            {
-                return reinterpret_cast<const uint8_t*>(this);
-            }
-
-        private:
-            unsigned :8;
-            unsigned m_Family : 8;
-            unsigned m_Port   : 16;
-            unsigned m_Address: 32;
+        class XorMappAddress : public XorMapped32 {
+        public:
+            XorMappAddress() :XorMapped32(Id::XorMapped) {}
         };
 
         class Software : public Header {

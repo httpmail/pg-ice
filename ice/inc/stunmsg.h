@@ -24,16 +24,16 @@ namespace STUN {
         using UnkonwnAttrContainer = std::set<ATTR::Id>;
 
     public:
-        MessagePacket(MsgType msgId, TransIdConstRef transId):
+        MessagePacket() {}
+
+        MessagePacket(MsgType msgId, TransIdConstRef transId) :
             m_StunPacket(msgId, transId), m_AttrLength(0)
         {
         }
 
         MessagePacket(const PACKET::stun_packet& packet, uint16_t packet_size);
 
-        ~MessagePacket()
-        {
-        }
+        virtual ~MessagePacket() = 0 {}
 
         bool IsTransIdEqual(TransIdConstRef transId) const
         {
@@ -69,15 +69,15 @@ namespace STUN {
             return m_UnsupportedAttrs.size() > 0;
         }
 
-        virtual void Finalize() = 0 {}
+        virtual void Finalize() = 0;
 
-        bool SendData(ICE::Channel& channel);
-        bool SendData(ICE::Channel& channel, const std::string& dest, uint16_t port);
+        int32_t SendData(ICE::Channel& channel);
+        int32_t SendData(ICE::Channel& channel, const std::string& dest, uint16_t port);
 
         const ATTR::MappedAddress*    GetAttribute(const ATTR::MappedAddress*& mapAddr) const;
-        const ATTR::XorMappedAddr*    GetAttribute(const ATTR::XorMappedAddr *& mapAddr) const;
+        const ATTR::XorMappAddress*    GetAttribute(const ATTR::XorMappAddress *& mapAddr) const;
         const ATTR::ChangeRequest*    GetAttribute(const ATTR::ChangeRequest*& changeReq) const;
-        const ATTR::XorMappedAddress* GetAttribute(const ATTR::XorMappedAddress*& xorMap) const;
+        const ATTR::XorMappedAddrSvr* GetAttribute(const ATTR::XorMappedAddrSvr*& xorMap) const;
         const ATTR::Role*             GetAttribute(const ATTR::Role*& role) const;
         const ATTR::Priority*         GetAttribute(const ATTR::Priority*& pri) const;
         const ATTR::UseCandidate*     GetAttribute(const ATTR::UseCandidate*& useCan) const;
@@ -93,17 +93,18 @@ namespace STUN {
 
         const UnkonwnAttrContainer& GetUnkonwnAttrs() const { return m_UnkonwnAttrs; }
 
-        void AddAttribute(const ATTR::MappedAddress &attr);
+        void AddAttribute(const ATTR::Address32 &attr);
+        void AddAttribute(const ATTR::XorMapped32 &attr);
         void AddAttribute(const ATTR::ChangeRequest &attr);
-        void AddAttribute(const ATTR::XorMappedAddress &attr);
         void AddAttribute(const ATTR::Role &attr);
         void AddAttribute(const ATTR::Priority &attr);
+        void AddAttribute(const ATTR::UseCandidate &attr);
+
         void AddPriority(uint32_t pri)
         {
             AddAttribute(ATTR::Priority(pri));
         }
 
-        void AddAttribute(const ATTR::UseCandidate &attr);
         void AddSoftware(const std::string& desc);
         void AddRealm(const std::string& realm);
         void AddErrorCode(uint16_t clsCode, uint16_t number, const std::string& reason);
@@ -130,6 +131,9 @@ namespace STUN {
          */
         uint8_t* AllocAttribute(ATTR::Id id, uint16_t size);
         void     AddTextAttribute(ATTR::Id id, const void* data, uint16_t size);
+
+    protected:
+        static void Finalize(MessagePacket &packet, const std::string& pwd);
 
     protected:
         uint16_t                m_AttrLength;
@@ -166,6 +170,7 @@ namespace STUN {
     public:
         SubBindReqMsg(uint32_t pri, const TransId& transId, bool bControlling, uint64_t tieBreaker, const std::string& username, const std::string& pwd);
         SubBindReqMsg(const PACKET::stun_packet& packet, uint16_t packet_size);
+        virtual ~SubBindReqMsg();
         virtual void Finalize() override;
 
     private:
@@ -174,9 +179,12 @@ namespace STUN {
 
     class SubBindRespMsg : public MessagePacket {
     public:
-        SubBindRespMsg(const TransId& transId, const ATTR::XorMappedAddress& xormapAddr);
+        SubBindRespMsg(const TransId& transId, const ATTR::XorMappAddress& xormapAddr, const std::string& pwd);
         SubBindRespMsg(const PACKET::stun_packet& packet, uint16_t packet_size);
-        virtual void Finalize() {}
+        virtual void Finalize() override;
+
+    private:
+        std::string m_pwd;
     };
 
     class SubBindErrRespMsg : public MessagePacket {
@@ -184,6 +192,6 @@ namespace STUN {
         SubBindErrRespMsg(TransIdConstRef id, uint8_t classCode, uint8_t number, const std::string& reason);
         SubBindErrRespMsg(TransIdConstRef id, const UnkonwnAttrContainer unknownAttr);
         SubBindErrRespMsg(const PACKET::stun_packet& packet, uint16_t packet_size);
-        virtual void Finalize() {}
+        virtual void Finalize() override;
     };
 }

@@ -97,56 +97,92 @@ namespace ICE {
             StatusChanged
         };
 
+    protected:
+        enum class CheckStatus : uint16_t {
+            failed,
+            nominated,
+            passed,
+        };
+
     public:
         CheckSession(Stream& owner, Channel &channel, const TimeOutInterval& timer, const UTILITY::AuthInfo &lauthInfo, const UTILITY::AuthInfo &rauthInfo);
         ~CheckSession();
 
     public:
-        bool CreateChecker(const Candidate &lcand, const Candidate &rcand);
-        uint32_t CheckerNumber() const { return m_Checks.size(); }
-        uint64_t TieBreaker()    const { return m_Owner.m_TieBreaker;}
-        bool IsControlling()     const { return m_Owner.m_bControlling; }
+        bool CreateChecker(uint64_t pri, const Candidate &lcand, const Candidate &rcand);
+        uint64_t TieBreaker() const { return m_Owner.m_TieBreaker;}
+        bool IsControlling()  const { return m_Owner.m_bControlling; }
 
     public:
         virtual bool Initilize() = 0;
 
     protected:
         void OnStart();
-        void OnStunMessage(const STUN::SubBindReqMsg &reqMsg);
+
+    private:
+        class Checker;
+        struct CheckListKey {
+        public:
+            CheckListKey() {}
+            CheckListKey(const std::string &key, uint64_t pri = 0) :
+                _key(key), _pri(pri)
+            {
+            }
+            bool operator()(const CheckListKey& v1, const CheckListKey& v2) const
+            {
+                if (v1._pri < v1._pri)
+                    return true;
+
+                if (v1._key == v2._key)
+                    return false;
+
+                if (v1._pri == v2._pri)
+                    return v1._key < v2._key;
+                else
+                    return v1._pri < v2._pri;
+            }
+
+            bool operator< (const CheckListKey& other) const
+            {
+                if (&other == this)
+                    return false;
+
+                return _key < other._key;
+
+                if (_pri < other._pri)
+                    return true;
+                else if (_pri > other._pri)
+                    return false;
+
+                return _key < other._key;
+#if 0
+                if (_pri == other._pri)
+                    return _key < other._key;
+
+                if (_key == other._key)
+                    return _key < other._key;
+
+                return _pri < other._pri;
+#endif
+            }
+
+            const std::string& Key() const { return _key; }
+            uint64_t Pri() const { return _pri; }
+        private:
+            std::string _key;
+            uint64_t    _pri;
+        };
+        using CheckList = std::map   <CheckListKey, Checker*>; /* @key = lcand ip + rcand ip*/
+
+    private:
+        void OnCheckerCompleted(Checker &chekcer, CheckStatus eStatus);
 
     private:
         static void RecvThread(CheckSession *pThis);
 
-    private:
-        class Checker;
-        struct KeyCmp {
-            bool operator()(const uint64_t *key1, const uint64_t *key2) const
-            {
-                assert(key1 && key2);
-
-                if (key1 == key2)
-                    return false;
-
-                if (key1[0] == key2[0])
-                    return key1[1] < key2[1];
-
-                return key1[0] < key2[0];
-            }
-        };
-
-        using CheckerContainer = std::map <const uint64_t*, Checker*, KeyCmp>;
-
-    private:
-        void OnCheckerCompleted(Checker &chekcer, bool bSucceed);
-
     protected:
         Channel               &m_Channel;
         const TimeOutInterval &m_Timer;
-        std::mutex             m_ChecksMutex;
-        CheckerContainer       m_Checks;
-        CheckerContainer       m_RemoteChecks;
-        CheckerContainer       m_SucceedChecks;
-        CheckerContainer       m_FailedChecks;
 
     private:
         Stream      &m_Owner;
@@ -155,7 +191,18 @@ namespace ICE {
     private:
         const UTILITY::AuthInfo &m_LAuthInfo;
         const UTILITY::AuthInfo &m_RAuthInfo;
+
+    private:
+        static std::mutex sCheckMutex;
+        static CheckList sCheckList;
+        static CheckList sFailedCheckList;
+        static CheckList sPassedCheckList;
     };
+
+    std::mutex Stream::CheckSession::sCheckMutex;
+    Stream::CheckSession::CheckList Stream::CheckSession::sCheckList;
+    Stream::CheckSession::CheckList Stream::CheckSession::sFailedCheckList;
+    Stream::CheckSession::CheckList Stream::CheckSession::sPassedCheckList;
 
     /////////////////////////////////////// UDPCheckSession class ////////////////////////////////////////////////
     class Stream::UDPCheckSession : public CheckSession {
@@ -163,13 +210,19 @@ namespace ICE {
         using Stream::CheckSession::CheckSession;
 
     public:
-        bool Initilize() override { assert(m_Checks.size()); OnStart(); return true; }
+        bool Initilize() override { OnStart(); return true; }
     };
 
     /////////////////////////////////////// TCPCheckSession class ////////////////////////////////////////////////
     class Stream::TCPCheckSession : public CheckSession {
     public:
-        using Stream::CheckSession::CheckSession;
+        TCPCheckSession(Stream& owner,
+                        Channel &channel,
+                        const std::string& peer,
+                        uint16_t port,
+                        const TimeOutInterval& timer,
+                        const UTILITY::AuthInfo &lauthInfo,
+                        const UTILITY::AuthInfo &rauthInfo);
 
     public:
         bool Initilize() override;
@@ -179,12 +232,14 @@ namespace ICE {
 
     private:
         std::thread m_ConnThrd;
+        const std::string m_peer;
+        const uint16_t    m_port;
     };
 
     /////////////////////////////////////// Stream class ////////////////////////////////////////////////
     Stream::Stream(uint16_t comp_id, Protocol protocol, const std::string& hostIP, uint16_t hostPort) :
         m_ComponentId(comp_id), m_LocalProtocol(protocol),
-        m_GatherSubscriber(this), m_CheckSubscriber(*this),
+        m_GatherSubscriber(this),
         m_DefIP(hostIP), m_DefPort(hostPort)
     {
         assert(hostPort);
@@ -268,30 +323,63 @@ namespace ICE {
 
     bool Stream::ConnectivityCheck(bool bControlling, CandPeerContainer & candPeers, const UTILITY::AuthInfo &lAuthInfo, const UTILITY::AuthInfo &rAuthInfo)
     {
+        using namespace PG;
+
+        class CheckSessionSubscriber : public PG::Subscriber {
+        public:
+            CheckSessionSubscriber(int16_t sess_cnt) :
+                m_SessCnt(sess_cnt)
+            {
+                assert(m_SessCnt);
+            }
+
+            void WaitSessionDone()
+            {
+                std::unique_lock<decltype(m_Mutex)> locker(m_Mutex);
+                m_Cond.wait(locker, [this]() {
+                    return this->m_SessCnt <= 0;
+                });
+            }
+
+        public:
+            virtual void OnPublished(const Publisher *publisher, MsgEntity::MSG_ID msgId, MsgEntity::WPARAM wParam, MsgEntity::LPARAM lParam) override
+            {
+                std::lock_guard<decltype(m_Mutex)> locker(m_Mutex);
+                if (m_SessCnt-- <= 0)
+                    m_Cond.notify_one();
+            }
+        private:
+            std::mutex              m_Mutex;
+            std::condition_variable m_Cond;
+            int16_t                 m_SessCnt;
+        };
+
         m_LocalAuthInfo     = lAuthInfo;
         m_RemoteAuthInfo    = rAuthInfo;
         m_bControlling      = bControlling;
 
+        CheckSessionContainer sessions;
         for (auto peer_itor = candPeers.begin(); peer_itor != candPeers.end(); ++peer_itor)
         {
             const Candidate &lcand = peer_itor->LCandidate();
             const Candidate &rcand = peer_itor->RCandidate();
+            auto pri = peer_itor->Priority();
 
             auto candchannel_itor = m_CandChannels.find(const_cast<Candidate*>(&lcand));
 
             assert(candchannel_itor != m_CandChannels.end());
 
             auto channel = candchannel_itor->second;
-            auto sess_itor = m_CheckSessions.find(channel);
+            auto sess_itor = sessions.find(channel);
 
             CheckSession* pSession(nullptr);
 
-            if (sess_itor == m_CheckSessions.end())
+            if (sess_itor == sessions.end())
             {
                 if(m_LocalProtocol == Protocol::udp)
                     pSession = new UDPCheckSession(*this, *channel, sUDPTimeoutInterval, m_LocalAuthInfo, m_RemoteAuthInfo);
                 else
-                    pSession = new TCPCheckSession(*this, *channel, sTCPTimeoutInterval, m_LocalAuthInfo, m_RemoteAuthInfo);
+                    pSession = new TCPCheckSession(*this, *channel, rcand.m_ConnIP, rcand.m_ConnPort, sTCPTimeoutInterval, m_LocalAuthInfo, m_RemoteAuthInfo);
             }
             else
             {
@@ -306,41 +394,47 @@ namespace ICE {
                 continue;
             }
 
-            if (!pSession->CreateChecker(lcand, rcand))
+            if (!pSession->CreateChecker(pri, lcand, rcand))
             {
                 LOG_ERROR("Stream", "Connectivity Check failed to Create check [%s:%d] => [%s:%d]",
                     channel->IP().c_str(), channel->Port(),
                     rcand.m_ConnIP.c_str(), rcand.m_ConnPort);
 
-                if (sess_itor == m_CheckSessions.end())
+                if (sess_itor == sessions.end())
                     delete pSession;
                 continue;
             }
 
-            if (sess_itor == m_CheckSessions.end() && !m_CheckSessions.insert(std::make_pair(channel, pSession)).second)
+            if (sess_itor == sessions.end() && !sessions.insert(std::make_pair(channel, pSession)).second)
             {
                 LOG_ERROR("Stream", "Connectivity Check failed to insert [%p], [%s:%d] => [%s:%d]",
                     channel,
                     channel->IP().c_str(), channel->Port(),
                     rcand.m_ConnIP.c_str(), rcand.m_ConnPort);
 
-                if (sess_itor == m_CheckSessions.end())
+                if (sess_itor == sessions.end())
                     delete pSession;
                 continue;
             }
 
         }
 
-        for (auto sess_itor = m_CheckSessions.begin(); sess_itor != m_CheckSessions.end(); ++sess_itor)
+        CheckSessionSubscriber subscriber(sessions.size());
+        for (auto sess_itor = sessions.begin(); sess_itor != sessions.end(); ++sess_itor)
         {
-            if (!sess_itor->second->Initilize())
+            if (!sess_itor->second->Initilize() || !sess_itor->second->Subscribe(&subscriber, static_cast<MsgEntity::MSG_ID>(CheckSession::Message::StatusChanged)))
             {
                 LOG_ERROR("Stream", "Connectivity Check cannot Start check session %lld", sess_itor->second);
                 continue;
             }
         }
 
+        subscriber.WaitSessionDone();
 
+        //
+        if (m_bControlling)
+        {
+        }
         return true;
     }
 
@@ -575,8 +669,8 @@ namespace ICE {
 
         {
             const STUN::ATTR::MappedAddress *pMappedAddr(nullptr);
-            const STUN::ATTR::XorMappedAddr *pXormapAddr(nullptr);
-            const STUN::ATTR::XorMappedAddress *pXormappedAddr(nullptr);
+            const STUN::ATTR::XorMappAddress *pXormapAddr(nullptr);
+            const STUN::ATTR::XorMappedAddrSvr *pXormappedAddr(nullptr);
             if (respMsg.GetAttribute(pMappedAddr))
             {
                 bSucceed = true;
@@ -639,7 +733,6 @@ namespace ICE {
             {
                 switch (packet.MsgId())
                 {
-
                 case STUN::MsgType::BindingErrResp:
                     pThis->OnStunMessage(STUN::FirstBindErrRespMsg(packet, bytes));
                     break;
@@ -761,7 +854,7 @@ namespace ICE {
     /////////////////////////////////////// Checker class ////////////////////////////////////////////////
     class Stream::CheckSession::Checker {
     public:
-        Checker(CheckSession& owner, const Candidate& lcand, const Candidate& rcand);
+        Checker(CheckSession& owner, uint64_t pri, const Candidate& lcand, const Candidate& rcand);
         ~Checker();
 
     protected:
@@ -769,22 +862,32 @@ namespace ICE {
             waiting_resp = 0,
             failed,
             succeed,
+            nominated,
             quit,
         };
 
-    public:
-        bool Start();
-        const uint64_t* TransId2Key() const { return reinterpret_cast<const uint64_t*>(m_Id); }
-        const Candidate& RemoteCandidate() const { return m_RemoteCandidate;}
-        const Candidate& LocalCandidate()  const { return m_LocalCandidate; }
+        enum TransmitStatus : uint8_t{
+            init = 0b00000000,
+            lr   = 0b00000001,
+            rl   = 0b00000010,
+        };
 
     public:
+        bool Start(bool bNominated = false);
+        uint64_t Priority() const { return m_Pri; }
+        const Candidate& RemoteCandidate() const { return m_RemoteCandidate;}
+        const Candidate& LocalCandidate()  const { return m_LocalCandidate; }
+        std::string MakeCheckListKey() const;
+
+    public:
+        void OnStunMessage(const STUN::SubBindReqMsg &reqMsg, const std::string& sender, uint16_t port);
         void OnStunMessage(const STUN::SubBindRespMsg &respMsg);
         void OnStunMessage(const STUN::SubBindErrRespMsg &errRespMsg);
         void OnRecvErrorEvent();
 
     private:
         void SetStatus(Status eStatus);
+        bool IsStatus(Status eStatus);
 
     private:
         static void SendThread(Checker* pThis);
@@ -793,34 +896,173 @@ namespace ICE {
         const Candidate         &m_LocalCandidate;
         const Candidate         &m_RemoteCandidate;
         CheckSession            &m_Owner;
-        STUN::TransId            m_Id;
         STUN::SubBindReqMsg     *m_pReqMsg;
         std::thread             m_SendThread;
+        std::condition_variable m_SendCond;
 
+        uint64_t                m_Pri;
         std::mutex              m_StatusMutex;
-        std::condition_variable m_StatusCond;
         Status                  m_Status;
+        std::mutex              m_TransStatusMutex;
+        uint8_t                 m_TransStatus;
     };
 
-    Stream::CheckSession::Checker::Checker(CheckSession & owner, const Candidate & lcand, const Candidate & rcand) :
-        m_Owner(owner), m_LocalCandidate(lcand), m_RemoteCandidate(rcand), m_pReqMsg(nullptr),m_Status(Status::waiting_resp)
+    Stream::CheckSession::Checker::Checker(CheckSession & owner, uint64_t pri, const Candidate & lcand, const Candidate & rcand) :
+        m_Owner(owner),
+        m_LocalCandidate(lcand),
+        m_RemoteCandidate(rcand),
+        m_pReqMsg(nullptr),
+        m_Pri(pri),
+        m_Status(Status::waiting_resp),
+        m_TransStatus(init)
     {
-        STUN::MessagePacket::GenerateRFC5389TransationId(m_Id);
     }
 
     Stream::CheckSession::Checker::~Checker()
     {
         delete m_pReqMsg;
+        m_pReqMsg = nullptr;
         if (m_SendThread.joinable())
             m_SendThread.join();
     }
 
-    bool Stream::CheckSession::Checker::Start()
+    bool Stream::CheckSession::Checker::Start(bool bNominated /*= false */)
     {
-        assert(m_Status == Status::waiting_resp);
+        using namespace STUN;
+
+        delete m_pReqMsg;
+
+        TransId id;
+        MessagePacket::GenerateRFC5389TransationId(id);
+        m_pReqMsg = new STUN::SubBindReqMsg(m_LocalCandidate.m_Priority,
+            id,
+            m_Owner.IsControlling(),
+            m_Owner.TieBreaker(),
+            m_Owner.m_RAuthInfo._ufrag + ":" + m_Owner.m_LAuthInfo._ufrag,
+            m_Owner.m_RAuthInfo._pwd);
+
+        if (!m_pReqMsg)
+            return false;
+
+        if (bNominated)
+            m_pReqMsg->AddAttribute(ATTR::UseCandidate());
 
         m_SendThread = std::thread(SendThread, this);
+        m_SendThread.detach();
         return true;
+    }
+
+    std::string Stream::CheckSession::Checker::MakeCheckListKey() const
+    {
+        try
+        {
+            return m_LocalCandidate.m_BaseIP + boost::lexical_cast<std::string>(m_LocalCandidate.m_BasePort) +
+                m_RemoteCandidate.m_ConnIP + boost::lexical_cast<std::string>(m_RemoteCandidate.m_ConnPort);
+        }
+        catch (const std::exception& e)
+        {
+            LOG_ERROR("Checker", "MakeCheckListKey exception [%s:%d]->[%s:%d]:%s",
+                m_LocalCandidate.m_BaseIP.c_str(), m_LocalCandidate.m_BasePort,
+                m_RemoteCandidate.m_ConnIP.c_str(), m_RemoteCandidate.m_ConnPort,
+                e.what());
+            return "";
+        }
+    }
+
+    void Stream::CheckSession::Checker::OnStunMessage(const STUN::SubBindReqMsg & reqMsg, const std::string & sender, uint16_t port)
+    {
+        using namespace STUN;
+        //RFC8445 [7.1.  STUN Extensions]
+        const ATTR::Role *pRole(nullptr);
+        const ATTR::Priority *pPriority(nullptr);
+        const ATTR::UseCandidate *pUseCandidate(nullptr);
+
+        if (!reqMsg.GetAttribute(pRole) && !reqMsg.GetAttribute(pPriority))
+        {
+            LOG_WARNING("Checker", "bind request has no role or priority attribute, ignored");
+            return;
+        }
+
+        if (m_Owner.IsControlling() && reqMsg.GetAttribute(pUseCandidate))
+        {
+            LOG_WARNING("Checker", "Controlling agent receviced 'use-candidate', ignored");
+            return;
+        }
+
+        if ( 0 == (m_TransStatus&TransmitStatus::rl)
+             && pUseCandidate)
+        {
+            LOG_ERROR("Checker", "Must be agressive mode, just ignored");
+            return;
+        }
+
+        {// RFC5389 10.2.2. Receiving a Request
+            const ATTR::MessageIntegrity *pMsgIntegrity(nullptr);
+            const ATTR::UserName *pUsername(nullptr);
+            if (!reqMsg.GetAttribute(pMsgIntegrity) || !reqMsg.GetAttribute(pUsername))
+            {
+                LOG_ERROR("CheckSession", "400 MessageIntegrity unmatched");
+                // 400 bad request
+                SubBindErrRespMsg errRespMsg(reqMsg.TransationId(), 4, 0, "bad-request");
+                errRespMsg.SendData(m_Owner.m_Channel, sender, port);
+            }
+            else if ((m_Owner.m_LAuthInfo._ufrag + ":" + m_Owner.m_RAuthInfo._ufrag) != pUsername->Name())
+            {
+                // 401 Unauthorized
+                SubBindErrRespMsg errRespMsg(reqMsg.TransationId(), 4, 1, "unmatched-username");
+                errRespMsg.SendData(m_Owner.m_Channel, sender, port);
+            }
+            else if (!MessagePacket::VerifyMsgIntegrity(reqMsg, m_Owner.m_LAuthInfo._pwd))
+            {
+                // 401 Unauthorized
+                SubBindErrRespMsg errRespMsg(reqMsg.TransationId(), 4, 1, "unmatched-MsgIntegrity");
+                errRespMsg.SendData(m_Owner.m_Channel, sender, port);
+            }
+            else if (reqMsg.GetUnkonwnAttrs().size())
+            {
+                SubBindErrRespMsg errRespMsg(reqMsg.TransationId(), 4, 20, "Unknown-Attribute");
+                errRespMsg.AddUnknownAttributes(reqMsg.GetUnkonwnAttrs());
+                errRespMsg.SendData(m_Owner.m_Channel, sender, port);
+            }
+            else if ((m_Owner.IsControlling()) == (pRole->Type() == ATTR::Id::IceControlling))
+            {
+                // RFC8445 [7.3.1.1.  Detecting and Repairing Role Conflicts]
+                if ((m_Owner.IsControlling() && m_Owner.TieBreaker() >= pRole->TieBreaker()) ||
+                    (!m_Owner.IsControlling() && m_Owner.TieBreaker() < pRole->TieBreaker()))
+                {
+                    SubBindErrRespMsg errRespMsg(reqMsg.TransationId(), 4, 87, "Role-Conflict");
+                    errRespMsg.SendData(m_Owner.m_Channel, sender, port);
+                }
+                else
+                {
+                    //TODO switch role
+                }
+            }
+            else
+            {
+                assert(!pUseCandidate || (pUseCandidate && (m_TransStatus & TransmitStatus::rl)));
+
+                ATTR::XorMappAddress xorMapAddr;
+                xorMapAddr.Port(port);
+
+                //TODO current we only support ipv4
+                assert(boost::asio::ip::address::from_string(sender).is_v4());
+
+                xorMapAddr.Address(boost::asio::ip::address::from_string(sender).to_v4().to_uint());
+                SubBindRespMsg respMsg(reqMsg.TransationId(), xorMapAddr, m_Owner.m_LAuthInfo._pwd);
+
+                // if send response faild just set as never received this message
+                if (respMsg.SendData(m_Owner.m_Channel, sender, port))
+                {
+                    m_TransStatus |= TransmitStatus::rl;
+                    if (pUseCandidate)
+                    {
+                        SetStatus(Status::nominated);
+                        m_SendCond.notify_one();
+                    }
+                }
+            }
+        }
     }
 
     void Stream::CheckSession::Checker::OnStunMessage(const STUN::SubBindRespMsg & respMsg)
@@ -828,8 +1070,18 @@ namespace ICE {
         using namespace STUN;
 
         LOG_INFO("CheckSession", "SubBindRespMsg Received");
+
+        assert(m_pReqMsg);
+
         const ATTR::MessageIntegrity *pMsgIntegrity(nullptr);
-        if (!respMsg.GetAttribute(pMsgIntegrity) || !MessagePacket::VerifyMsgIntegrity(respMsg, m_Owner.m_LAuthInfo._pwd))
+
+        if (!respMsg.IsTransIdEqual(m_pReqMsg->TransationId()))
+        {
+            LOG_ERROR("Checker", "unequal transation Id");
+            return;
+        }
+
+        if (!respMsg.GetAttribute(pMsgIntegrity) || !MessagePacket::VerifyMsgIntegrity(respMsg, m_Owner.m_RAuthInfo._pwd))
         {
             /*
             RFC5389 [10.1.3.  Receiving a Response]
@@ -837,8 +1089,12 @@ namespace ICE {
             MESSAGE-INTEGRITY was absent, the response MUST be discarded, as if
             it was never received
             */
+            LOG_ERROR("Checker", "illegal message-integrity");
+            return;
         }
-        else if (respMsg.GetUnkonwnAttrs().size())
+
+        const ATTR::XorMappAddress *pXorMapAddr(nullptr);
+        if (respMsg.GetUnkonwnAttrs().size())
         {
             /*
             RFC5389 [7.3.3.  Processing a Success Response]
@@ -846,13 +1102,13 @@ namespace ICE {
             attributes, the response is discarded and the transaction is
             considered to have failed.
             */
-            std::lock_guard<decltype(m_StatusMutex)> locker(m_StatusMutex);
-            m_Status = Status::failed;
-            m_StatusCond.notify_one();
+            LOG_ERROR("Checker", "found unkonwn-attributs, set transaction as failed");
+            SetStatus(Status::failed);
+            m_SendCond.notify_one();
         }
-
-        const ATTR::XorMappedAddress *pXorMapAddr(nullptr);
-        if (respMsg.GetAttribute(pXorMapAddr))
+        else if (respMsg.GetAttribute(pXorMapAddr) && 
+                 pXorMapAddr->IP() == m_LocalCandidate.m_BaseIP &&
+                 pXorMapAddr->Port() == m_LocalCandidate.m_BasePort)
         {
             /*
             RFC5245 [7.1.3.1.  Failure Cases]
@@ -865,29 +1121,15 @@ namespace ICE {
             symmetric.  If they are not symmetric, the agent sets the state of
             the pair to Failed.
             */
-            if (pXorMapAddr->IP() == m_LocalCandidate.m_BaseIP && pXorMapAddr->Port() == m_LocalCandidate.m_BasePort)
-            {
-                LOG_INFO("Checker", "valid resp msg L<=>R [%s:%d] <=>[%s:%d]",
-                    m_LocalCandidate.m_BaseIP.c_str(), m_LocalCandidate.m_BasePort,
-                    m_RemoteCandidate.m_ConnIP.c_str(), m_RemoteCandidate.m_ConnPort);
-
-                std::lock_guard<decltype(m_StatusMutex)> locker(m_StatusMutex);
-                m_Status = Status::succeed;
-                m_StatusCond.notify_one();
-            }
-            else
-            {
-                LOG_ERROR("Stream", "SubRespMsg unsymmetric address");
-                std::lock_guard<decltype(m_StatusMutex)> locker(m_StatusMutex);
-                m_Status = Status::failed;
-                m_StatusCond.notify_one();
-            }
+            SetStatus(Status::succeed);
+            m_SendCond.notify_one();
         }
         else
         {
-            std::lock_guard<decltype(m_StatusMutex)> locker(m_StatusMutex);
-            m_Status = Status::failed;
-            m_StatusCond.notify_one();
+            LOG_ERROR("Checker", "No XormappAddress or no symmetric address [%s:%d]",
+                pXorMapAddr->IP().c_str(), pXorMapAddr->Port());
+            SetStatus(Status::failed);
+            m_SendCond.notify_one();
         }
     }
 
@@ -895,10 +1137,18 @@ namespace ICE {
     {
         using namespace STUN;
 
+        assert(m_pReqMsg);
+
         const ATTR::ErrorCode *pErrCode(nullptr);
         const ATTR::MessageIntegrity *pMsgIntegrity(nullptr);
 
         LOG_INFO("CheckSession", "SubBindErrRespMsg Received");
+
+        if (!errRespMsg.IsTransIdEqual(m_pReqMsg->TransationId()))
+        {
+            LOG_ERROR("Checker", "unequal transation Id");
+            return;
+        }
 
         if (!errRespMsg.GetAttribute(pMsgIntegrity) || !MessagePacket::VerifyMsgIntegrity(errRespMsg, m_Owner.m_RAuthInfo._pwd))
         {
@@ -911,10 +1161,11 @@ namespace ICE {
             value matches the contents of the MESSAGE-INTEGRITY attribute, the
             response is considered authenticated.  If the value does not match,
             or if MESSAGE-INTEGRITY was absent, the response MUST be discarded,
-            as if it was never received.  This means that retransmits, if
+            as if it was never received. This means that retransmits, if
             applicable, will continue.
             */
             LOG_WARNING("Stream", "SubErrRespMsg cannot be authenticated, just discard this msg");
+            return;
         }
         else if (!errRespMsg.GetAttribute(pErrCode))
         {
@@ -922,6 +1173,8 @@ namespace ICE {
             there is no error code, invalid error resp message, set the status to failed
             */
             SetStatus(Status::failed);
+            m_SendCond.notify_one();
+            return;
         }
 
         auto errorCode = pErrCode->Code();
@@ -959,67 +1212,70 @@ namespace ICE {
         }
     }
 
-    void Stream::CheckSession::Checker::OnRecvErrorEvent()
-    {
-        LOG_ERROR("Checker", "On recv error");
-        std::lock_guard<decltype(m_StatusMutex)> locker(m_StatusMutex);
-        m_Status = Status::failed;
-        m_StatusCond.notify_one();
-    }
 
     void Stream::CheckSession::Checker::SetStatus(Status eStatus)
     {
-        assert(eStatus != Status::waiting_resp);
+        //assert(eStatus != Status::waiting_resp);
 
         std::lock_guard<decltype(m_StatusMutex)> locker(m_StatusMutex);
-
         m_Status = eStatus;
-        m_StatusCond.notify_one();
+    }
+
+    bool Stream::CheckSession::Checker::IsStatus(Status eStatus)
+    {
+        std::lock_guard<decltype(m_StatusMutex)> locker(m_StatusMutex);
+        return m_Status  == eStatus;
     }
 
     void Stream::CheckSession::Checker::SendThread(Checker * pThis)
     {
-        assert(pThis && !pThis->m_pReqMsg);
-        //std::this_thread::sleep_for(std::chrono::seconds(1000000));
-        pThis->m_pReqMsg = new STUN::SubBindReqMsg(pThis->m_LocalCandidate.m_Priority, pThis->m_Id, true, 0,
-            pThis->m_Owner.m_RAuthInfo._ufrag + ":" + pThis->m_Owner.m_LAuthInfo._ufrag,
-            pThis->m_Owner.m_RAuthInfo._pwd);
+        assert(pThis && pThis->m_pReqMsg);
 
-        if (pThis->m_pReqMsg)
+        pThis->SetStatus(Status::waiting_resp);
+
+        auto timer_cnt  = pThis->m_Owner.m_Timer.size();
+        auto& recver_ip = pThis->RemoteCandidate().m_ConnIP;
+        auto  port      = pThis->RemoteCandidate().m_ConnPort;
+
+        std::mutex send_mutex;
+
+        for (decltype(timer_cnt) i = 0; i < timer_cnt; ++i)
         {
-            auto timer_cnt = pThis->m_Owner.m_Timer.size();
-
-            auto& recver_ip = pThis->RemoteCandidate().m_ConnIP;
-            auto  recver_port = pThis->RemoteCandidate().m_ConnPort;
-
-            for (decltype(timer_cnt) i = 0; i < timer_cnt; ++i)
+            if (0 >= pThis->m_pReqMsg->SendData(pThis->m_Owner.m_Channel, recver_ip, port))
             {
-                if (!pThis->m_pReqMsg->SendData(pThis->m_Owner.m_Channel, recver_ip, recver_port))
-                {
-                    LOG_ERROR("Checker", "Cannot Send Data [%s:%d] => [%s:%d], set status to failed",
-                        pThis->m_LocalCandidate.m_BaseIP.c_str(), pThis->m_LocalCandidate.m_BasePort,
-                        pThis->m_RemoteCandidate.m_ConnIP.c_str(), pThis->m_RemoteCandidate.m_ConnPort);
-
-                    pThis->SetStatus(Status::failed);
-                    break;
-                }
-
-                std::unique_lock<decltype(pThis->m_StatusMutex)> locker(pThis->m_StatusMutex);
-                auto ret = pThis->m_StatusCond.wait_for(locker, std::chrono::milliseconds(pThis->m_Owner.m_Timer[i]), [pThis]() {
-                    return pThis->m_Status != Status::waiting_resp;
-                });
-
-                if (ret)
-                {
-                    LOG_INFO("Check", "%s, [%s : %d] => [%s : %d]",
-                        (pThis->m_Status == Status::succeed ? "Succeed" : "Failed"),
-                        pThis->m_LocalCandidate.m_BaseIP.c_str(), pThis->m_LocalCandidate.m_BasePort,
-                        pThis->m_RemoteCandidate.m_ConnIP.c_str(), pThis->m_RemoteCandidate.m_BasePort);
-                    break;
-                }
+                LOG_ERROR("Checker", "Cannot Send Data [%s:%d] => [%s:%d], set status to failed",
+                    pThis->m_LocalCandidate.m_BaseIP.c_str(), pThis->m_LocalCandidate.m_BasePort,
+                    pThis->m_RemoteCandidate.m_ConnIP.c_str(), pThis->m_RemoteCandidate.m_ConnPort);
+                pThis->SetStatus(Status::failed);
+                break;
             }
+
+            if (!pThis->IsStatus(Status::waiting_resp))
+                break;
+
+                std::unique_lock<decltype(send_mutex)> locker(send_mutex);
+                auto ret = pThis->m_SendCond.wait_for(locker, std::chrono::milliseconds(pThis->m_Owner.m_Timer[i]));
+                if (std::_Cv_status::timeout != ret)
+                    break;
         }
-        pThis->m_Owner.OnCheckerCompleted(*pThis, pThis->m_Status == Status::succeed);
+
+        std::lock_guard<decltype(pThis->m_StatusMutex)> locker(pThis->m_StatusMutex);
+        if (Status::waiting_resp == pThis->m_Status)
+        {
+            LOG_ERROR("Checker", "Connectivity Check  timeout [%s:%d] => [%s:%d]",
+                pThis->m_LocalCandidate.m_BaseIP.c_str(), pThis->m_LocalCandidate.m_BasePort,
+                pThis->m_RemoteCandidate.m_ConnIP.c_str(), pThis->m_RemoteCandidate.m_ConnPort);
+
+            pThis->m_Status = Status::failed;
+        }
+
+        CheckSession::CheckStatus status = CheckStatus::failed;
+        if (pThis->m_Status == Status::succeed)
+            status = CheckStatus::passed;
+        else if (pThis->m_Status == Status::nominated)
+            status = CheckStatus::nominated;
+
+        pThis->m_Owner.OnCheckerCompleted(*pThis, status);
     }
 
     /////////////////////////////////////// CheckSession class ////////////////////////////////////////////////
@@ -1036,19 +1292,24 @@ namespace ICE {
             m_RecvThrd.join();
     }
 
-    bool Stream::CheckSession::CreateChecker(const Candidate & lcand, const Candidate & rcand)
+    bool Stream::CheckSession::CreateChecker(uint64_t pri, const Candidate & lcand, const Candidate & rcand)
     {
-        std::auto_ptr<Checker> checker(new Checker(*this, lcand, rcand));
+        std::auto_ptr<Checker> checker(new Checker(*this, pri, lcand, rcand));
         if (!checker.get())
             return false;
 
-        auto ret = m_Checks.insert(std::make_pair(checker->TransId2Key(), checker.get()));
-        if (!ret.second)
+        auto list_ret = sCheckList.insert(std::make_pair(CheckListKey(checker->MakeCheckListKey(), checker->Priority()), checker.get()));
+
+        if (!list_ret.second)
+        {
+            LOG_ERROR("CheckSession", "Insert sCheckList error");
             return false;
+        }
 
         if (!checker->Start())
         {
-            m_Checks.erase(ret.first);
+            sCheckList.erase(list_ret.first);
+            LOG_ERROR("CheckSession", "Cannot Start Checker");
             return false;
         }
 
@@ -1061,104 +1322,11 @@ namespace ICE {
         m_RecvThrd = std::thread(RecvThread, this);
     }
 
-    void Stream::CheckSession::OnStunMessage(const STUN::SubBindReqMsg & reqMsg)
-    {
-#if 0
-        using namespace STUN;
-
-        const ATTR::MessageIntegrity *pMsgIntegrity(nullptr);
-        const ATTR::UserName *pUsername(nullptr);
-        const ATTR::Role *pRole(nullptr);
-        const ATTR::Priority *pPriority(nullptr);
-        const ATTR::UseCandidate *pUseCandAttr(nullptr);
-
-        LOG_INFO("CheckSession", "SubBindReqMsg Received");
-        /*
-        RFC8445 [7.1.  STUN Extensions]
-        */
-        if (!reqMsg.GetAttribute(pRole) && !reqMsg.GetAttribute(pPriority))
-        {
-            LOG_WARNING("Stream", "bind request has no role or priority attribute, just discards");
-            return;
-        }
-
-        assert(pRole);
-
-        reqMsg.GetAttribute(pUseCandAttr);
-        if (pRole->Type() == ATTR::Id::IceControlled && pUseCandAttr)
-        {
-            /*
-            RFC8445[7.1.2.  USE-CANDIDATE]
-
-            The controlling agent MUST include the USE-CANDIDATE attribute in
-            order to nominate a candidate pair (Section 8.1.1).  The controlled
-            agent MUST NOT include the USE-CANDIDATE attribute in a Binding
-            request.
-            */
-            LOG_WARNING("Stream", "The controlled agent MUST NOT include the USE - CANDIDATE attribute in a Binding request");
-            return;
-        }
-        /*
-        RFC5389 10.2.2. Receiving a Request
-        */
-        reqMsg.GetAttribute(pMsgIntegrity);
-        reqMsg.GetAttribute(pUsername);
-        if (!pMsgIntegrity && !pUsername)
-        {
-            // 400 bad request
-            SubBindErrRespMsg errRespMsg(m_pReqMsg->TransationId(), 4, 0, "bad-request");
-            errRespMsg.SendData(m_Owner.m_Channel, m_RemoteCandidate.m_ConnIP, m_RemoteCandidate.m_ConnPort);
-        }
-        else if (pUsername && (m_Owner.m_LAuthInfo._ufrag + ":" + m_Owner.m_RAuthInfo._ufrag) != pUsername->Name())
-        {
-            // 401 Unauthorized
-            SubBindErrRespMsg errRespMsg(m_pReqMsg->TransationId(), 4, 1, "unmatched-username");
-            errRespMsg.SendData(m_Owner.m_Channel, m_RemoteCandidate.m_ConnIP, m_RemoteCandidate.m_ConnPort);
-        }
-        else if (!MessagePacket::VerifyMsgIntegrity(reqMsg, m_Owner.m_LAuthInfo._pwd))
-        {
-            // 401 Unauthorized
-            SubBindErrRespMsg errRespMsg(m_pReqMsg->TransationId(), 4, 1, "unmatched-MsgIntegrity");
-            errRespMsg.SendData(m_Owner.m_Channel, m_RemoteCandidate.m_ConnIP, m_RemoteCandidate.m_ConnPort);
-        }
-        else if (reqMsg.GetUnkonwnAttrs().size())
-        {
-            SubBindErrRespMsg errRespMsg(m_pReqMsg->TransationId(), 4, 20, "Unknown-Attribute");
-            errRespMsg.AddUnknownAttributes(reqMsg.GetUnkonwnAttrs());
-            errRespMsg.SendData(m_Owner.m_Channel, m_RemoteCandidate.m_ConnIP, m_RemoteCandidate.m_ConnPort);
-        }
-        else if (m_Owner.IsControlling() == (pRole->Type() == ATTR::Id::IceControlling))
-        {
-            // RFC8445 [7.3.1.1.  Detecting and Repairing Role Conflicts]
-            if ((m_Owner.IsControlling() && m_Owner.TieBreaker() >= pRole->TieBreaker()) ||
-                (!m_Owner.IsControlling() && m_Owner.TieBreaker() < pRole->TieBreaker()))
-            {
-                SubBindErrRespMsg errRespMsg(m_pReqMsg->TransationId(), 4, 87, "Role-Conflict");
-                errRespMsg.SendData(m_Owner.m_Channel, m_RemoteCandidate.m_ConnIP, m_RemoteCandidate.m_ConnPort);
-            }
-            else
-            {
-                //TODO switch role
-            }
-        }
-        else
-        {
-            // now we can send success response message
-            ATTR::XorMappedAddress xorMapAddr;
-            xorMapAddr.Port(m_RemoteCandidate.m_ConnPort);
-
-            assert(boost::asio::ip::address::from_string(m_RemoteCandidate.m_ConnIP).is_v4());
-
-            xorMapAddr.Address(boost::asio::ip::address::from_string(m_RemoteCandidate.m_ConnIP).to_v4().to_uint());
-            SubBindRespMsg respMsg(m_pReqMsg->TransationId(), xorMapAddr);
-            respMsg.SendData(m_Owner.m_Channel, m_RemoteCandidate.m_ConnIP, m_RemoteCandidate.m_ConnPort);
-        }
-#endif
-    }
-
     void Stream::CheckSession::RecvThread(CheckSession *pThis)
     {
         assert(pThis);
+        std::string local = pThis->m_Channel.IP() + boost::lexical_cast<std::string>(pThis->m_Channel.Port());
+
         while (1)
         {
             STUN::PACKET::stun_packet packet;
@@ -1168,83 +1336,119 @@ namespace ICE {
 
             if (STUN::MessagePacket::IsValidStunPacket(packet, bytes))
             {
-
-                if (packet.MsgId() == STUN::MsgType::BindingRequest)
+                Checker *checker(nullptr);
                 {
-                    bool ret = STUN::MessagePacket::VerifyMsgIntegrity(STUN::SubBindReqMsg(packet, bytes), pThis->m_LAuthInfo._pwd);
-                    pThis->OnStunMessage(STUN::SubBindReqMsg(packet, bytes));
-                }
-                else
-                {
-                    auto checker_itor = pThis->m_Checks.find(reinterpret_cast<const uint64_t*>(packet.TransId()));
-                    if (checker_itor == pThis->m_Checks.end())
+                    std::string remote = sender_ip + boost::lexical_cast<std::string>(sender_port);
+                    std::lock_guard<decltype(sCheckMutex)> locker(sCheckMutex);
+                    auto itor = sCheckList.find(CheckListKey(local + remote));
+                    if (itor == sCheckList.end())
                     {
-                        LOG_ERROR("CheckSession", "received message id = [%d] , but no corresponding checker", packet.MsgId());
+                        LOG_ERROR("CheckSession", "sender not in check list [%s:%d], msg [%d]",
+                            sender_ip.c_str(), sender_port, packet.MsgId());
                         continue;
                     }
-                    auto checker = checker_itor->second;
+                    checker = itor->second;
+                }
 
-                    switch (packet.MsgId())
-                    {
-                    case STUN::MsgType::BindingErrResp:
-                        checker->OnStunMessage(STUN::SubBindErrRespMsg(packet, bytes));
-                        break;
+                assert(checker);
+                switch (packet.MsgId())
+                {
 
-                    case STUN::MsgType::BindingResp:
-                        checker->OnStunMessage(STUN::SubBindRespMsg(packet, bytes));
-                        break;
-                    default:
-                        break;
-                    }
+                case STUN::MsgType::BindingRequest:
+                    checker->OnStunMessage(STUN::SubBindReqMsg(packet, bytes), sender_ip, sender_port);
+                    break;
+
+                case STUN::MsgType::BindingErrResp:
+                    checker->OnStunMessage(STUN::SubBindErrRespMsg(packet, bytes));
+                    break;
+
+                case STUN::MsgType::BindingResp:
+                    checker->OnStunMessage(STUN::SubBindRespMsg(packet, bytes));
+                    break;
+                default:
+                    break;
                 }
             }
         }
     }
 
-    void Stream::CheckSession::OnCheckerCompleted(Checker & checker, bool bSucceed)
+    void Stream::CheckSession::OnCheckerCompleted(Checker & checker, CheckStatus eStatus)
     {
-        std::lock_guard<decltype(m_ChecksMutex)> locker(m_ChecksMutex);
+        std::unique_lock<decltype(sCheckMutex)> locker(sCheckMutex);
 
-        auto key = checker.TransId2Key();
+        CheckListKey key(checker.MakeCheckListKey(), checker.Priority());
+        auto itor = sCheckList.find(key);
 
-        auto checker_itor = m_Checks.find(key);
-
-        assert(checker_itor != m_Checks.end());
-
-        auto check_container = bSucceed ? m_SucceedChecks : m_FailedChecks;
-
-        check_container.insert(std::make_pair(key, &checker));
-
-        m_Checks.erase(checker_itor);
-        if (m_Checks.empty())
+        if (itor == sCheckList.end())
         {
-            LOG_INFO("CheckSession", "Connectivity completed [%s]", bSucceed ? "Succeed" : "Failed");
-            Publish(static_cast<PG::MsgEntity::MSG_ID>(Message::StatusChanged), nullptr, nullptr);
+            LOG_ERROR("CheckSession", "checker [%p] is not in checklist", &checker);
+            return;
         }
+
+        if (eStatus == CheckStatus::nominated)
+        {
+            LOG_ERROR("CheckSession", "Connectivity Check Succeed");
+            return;
+        }
+
+        if (CheckStatus::passed == eStatus && itor == sCheckList.begin() && m_Owner.m_bControlling)
+        {
+            // highest priority checker has been done, we can start to nominating now
+            checker.Start(true);
+        }
+
+        auto& list = eStatus == CheckStatus::failed ? sFailedCheckList : sPassedCheckList;
+        auto ret = list.insert(std::make_pair(key, &checker)).second;
+
+        LOG_INFO("CheckSession", "Insert checker [%p] to [%s ] list [%s]",
+            &checker,
+            eStatus == CheckStatus::failed ? "sFailedCheckList" : "sPassedCheckList",
+            ret ? "succedd" : "failed");
+
+        if (sCheckList.size() == (sFailedCheckList.size() + sPassedCheckList.size()))
+        {
+            if (sPassedCheckList.empty())
+            {
+                LOG_INFO("CheckSession", "Connectivity Check Failed");
+            }
+            else if(m_Owner.m_bControlling)
+            {
+                sPassedCheckList.begin()->second->Start(true);
+                LOG_INFO("CheckSession", "Connectivity Check has been done, start to nominating");
+            }
+            else
+            {
+                LOG_INFO("CheckSession", "Connectivity Check has been done, wait for nominating");
+            }
+        }
+    }
+
+    Stream::TCPCheckSession::TCPCheckSession(Stream & owner,
+        Channel & channel,
+        const std::string & peer,
+        uint16_t port,
+        const TimeOutInterval & timer,
+        const UTILITY::AuthInfo & lauthInfo,
+        const UTILITY::AuthInfo & rauthInfo) :
+        CheckSession(owner, channel, timer, lauthInfo,rauthInfo), m_peer(peer),m_port(port)
+    {
     }
 
     /////////////////////////////////////// TCPCheckSession class ////////////////////////////////////////////////
     bool Stream::TCPCheckSession::Initilize()
     {
-        assert(m_Checks.size() == 1);
-
         m_ConnThrd = std::thread(ConnectThread, this);
         return true;
     }
 
     void Stream::TCPCheckSession::ConnectThread(TCPCheckSession * pThis)
     {
-        assert(pThis && pThis->m_Checks.size() == 1);
-
-        auto checker = pThis->m_Checks.begin()->second;
-
-        if (!pThis->m_Channel.Connect(checker->RemoteCandidate().m_ConnIP, checker->RemoteCandidate().m_ConnPort))
+        if (!pThis->m_Channel.Connect(pThis->m_peer, pThis->m_port))
         {
             pThis->Publish(static_cast<PG::MsgEntity::MSG_ID>(Message::StatusChanged), false, nullptr);
 
             LOG_ERROR("TCPCheckSession", "cannot make connection to [%s:%d]",
-                checker->RemoteCandidate().m_ConnIP.c_str(),
-                checker->RemoteCandidate().m_ConnPort);
+                pThis->m_peer.c_str(), pThis->m_port);
             return;
         }
         pThis->OnStart();
@@ -1254,6 +1458,4 @@ namespace ICE {
     {
     }
 }
-
-
 
