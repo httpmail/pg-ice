@@ -88,18 +88,30 @@ namespace ICE {
     {
     }
 
+    void Session::SetControlling(bool bControlling)
+    {
+        std::lock_guard<decltype(m_ControllingMutex)> locker(m_ControllingMutex);
+        bControlling = bControlling;
+    }
+
+    bool Session::IsControlling() const
+    {
+        std::lock_guard<decltype(m_ControllingMutex)> locker(m_ControllingMutex);
+        return m_bControlling;
+    }
+
     bool Session::CreateMedia(const MediaAttr& mediaAttr)
     {
         if (m_Medias.end() != m_Medias.find(mediaAttr.m_Name))
         {
-            LOG_WARNING("Session", "Media %s already existed", mediaAttr.m_Name);
+            LOG_WARNING("Session", "Media [%s] already existed", mediaAttr.m_Name.c_str());
             return false;
         }
 
-        std::auto_ptr<Media> media(new Media);
+        std::auto_ptr<Media> media(new Media(*this));
         if (!media.get())
         {
-            LOG_ERROR("Session", "Not Enough memory to create Media");
+            LOG_ERROR("Session", "Failed to Media [%s]", mediaAttr.m_Name.c_str());
             return false;
         }
 
@@ -108,7 +120,7 @@ namespace ICE {
         {
             if (!media->CreateStream(itor->m_CompId, itor->m_Protocol, itor->m_HostIP, itor->m_HostPort))
             {
-                LOG_ERROR("Session", "Media [%s] Create Stream failed [%d] [%s:%d]", mediaAttr.m_Name, itor->m_CompId, itor->m_HostIP.c_str(), itor->m_HostPort);
+                LOG_ERROR("Session", "Media [%s] failed to Create Stream [%d] [%s:%d]", mediaAttr.m_Name, itor->m_CompId, itor->m_HostIP.c_str(), itor->m_HostPort);
                 return false;
             }
         }
@@ -220,15 +232,13 @@ namespace ICE {
         // connectivity check
         for (auto check_itor = m_CheckList.begin(); check_itor != m_CheckList.end(); ++check_itor)
         {
-            auto stream = check_itor->first.m_pStream;
-            assert(stream && check_itor->second);
+            assert(check_itor->second);
 
-            if (!stream->ConnectivityCheck(m_bControlling, *check_itor->second, 
-                UTILITY::AuthInfo(check_itor->first.m_LPwd,check_itor->first.m_LUfrag),
-                UTILITY::AuthInfo(check_itor->first.m_RPwd, check_itor->first.m_RUfrag)))
-                continue;
+            m_ConnCheckThrds.push_back(std::thread(ConnectivityCheckThread, this, &check_itor->first, check_itor->second));
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(Configuration::Instance().Ta()));
+            std::mutex mutex;
+            std::unique_lock<decltype(mutex)> locker(mutex);
+            m_ConnCheckCond.wait_for(locker, std::chrono::milliseconds(Configuration::Instance().Ta()));
         }
 
         return true;
@@ -243,5 +253,14 @@ namespace ICE {
     bool Session::MakeAnswer(const std::string & remoteOffer, std::string & answer)
     {
         return true;
+    }
+
+    void Session::ConnectivityCheckThread(Session * pThis, const StreamInfo* streamInfo, CandPeerContainer * peers)
+    {
+        assert(pThis && peers && streamInfo);
+
+        auto ret = streamInfo->m_pStream->ConnectivityCheck(*peers);
+
+        pThis->m_ConnCheckCond.notify_one();
     }
 }

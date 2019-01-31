@@ -37,9 +37,11 @@ namespace ICE{
 
         virtual int32_t Recv(void *buffer, int32_t size, bool framing = false) noexcept = 0;
         virtual int32_t Recv(void *buffer, int32_t size, std::string &sender_ip, uint16_t &sender_port, bool framing = false) noexcept = 0;
+        virtual int32_t Recv(void *buffer, int32_t size, boost::asio::ip::address &sender, uint16_t port, bool framing) noexcept = 0;
 
         virtual int32_t Send(const void *buffer, int32_t size, bool framing = false) noexcept = 0;
         virtual int32_t Send(const void *buffer, int32_t size, const std::string &recver_ip, uint16_t recver_port, bool framing = false) noexcept = 0;
+        virtual int32_t Send(const void *buffer, int32_t size, const boost::asio::ip::address &recver, uint16_t port, bool framing) noexcept = 0;
 
         virtual bool Connect(const std::string& destip, uint16_t port) noexcept = 0;
         virtual bool Shutdown(ShutdownOption op) noexcept = 0;
@@ -76,9 +78,11 @@ namespace ICE{
 
         virtual int32_t Recv(void *buffer, int32_t size, bool framing) noexcept override;
         virtual int32_t Recv(void *buffer, int32_t size, std::string &sender_ip, uint16_t &sender_port, bool framing) noexcept override;
+        virtual int32_t Recv(void *buffer, int32_t size, boost::asio::ip::address &sender, uint16_t port, bool framing) noexcept override;
 
         virtual int32_t Send(const void *buffer, int32_t size, bool framing) noexcept override;
         virtual int32_t Send(const void *buffer, int32_t size, const std::string &recver_ip, uint16_t recver_port, bool framing) noexcept override;
+        virtual int32_t Send(const void *buffer, int32_t size, const boost::asio::ip::address &recver, uint16_t port, bool framing) noexcept override;
 
         virtual bool Connect(const std::string& ip, uint16_t port) noexcept override;
         virtual bool Shutdown(ShutdownOption op) noexcept override;
@@ -106,9 +110,12 @@ namespace ICE{
 
         virtual int32_t Recv(void *buffer, int32_t size, bool framing) noexcept override;
         virtual int32_t Recv(void *buffer, int32_t size, std::string &sender_ip, uint16_t &sender_port, bool framing) noexcept override;
+        virtual int32_t Recv(void *buffer, int32_t size, boost::asio::ip::address &sender, uint16_t port, bool framing) noexcept override;
 
         virtual int32_t Send(const void *buffer, int32_t size, bool framing) noexcept override;
         virtual int32_t Send(const void *buffer, int32_t size, const std::string &recver_ip, uint16_t recver_port, bool framing) noexcept override;
+        virtual int32_t Send(const void *buffer, int32_t size, const boost::asio::ip::address &recver, uint16_t port, bool framing) noexcept override;
+
 
         virtual bool Connect(const std::string& destip, uint16_t port) noexcept override;
         virtual bool Shutdown(ShutdownOption op) noexcept override;

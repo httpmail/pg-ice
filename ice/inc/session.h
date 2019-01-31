@@ -1,10 +1,11 @@
 #pragma once
 
-#include <map>
-
 #include "streamdef.h"
 #include "candidate.h"
 
+#include <map>
+#include <thread>
+#include <mutex>
 #include <assert.h>
 
 namespace ICE {
@@ -44,7 +45,8 @@ namespace ICE {
         Session(const std::string& sessionName = "-", const std::string& userName = "-");
         virtual ~Session();
 
-        void SetControlling(bool bControlling = true) { m_bControlling = bControlling; }
+        void SetControlling(bool bControlling = true);
+        bool IsControlling() const;
         bool CreateMedia(const MediaAttr& mediaAttr);
         bool ConnectivityCheck(const std::string& offer);
         bool MakeOffer(std::string& offer);
@@ -55,7 +57,19 @@ namespace ICE {
         const std::string& Username()  const  { return m_Username;  }
         const std::string& DefaultIP() const  { return m_DefaultIP; }
         const std::string& SessionName() const { return m_SessionName; }
+
+        uint64_t Tiebreaker() const { return m_Tiebreaker; }
+
     private:
+        static void ConnectivityCheckThread(Session * pThis, const StreamInfo* streamInfo, CandPeerContainer * peers);
+
+    private:
+        using Threads = std::vector<std::thread>;
+
+    private:
+
+        std::condition_variable m_ConnCheckCond;
+        Threads                 m_ConnCheckThrds;
 
         MediaContainer m_Medias;
         CheckContainer m_CheckList;
@@ -68,6 +82,8 @@ namespace ICE {
         const std::string m_SessionName; /*for SDP*/
         const uint64_t m_Tiebreaker;     /* rfc8445 16.1 */
         const std::string m_DefaultIP;
-        bool m_bControlling;
+
+        mutable std::mutex  m_ControllingMutex;
+        bool                m_bControlling;
     };
 }

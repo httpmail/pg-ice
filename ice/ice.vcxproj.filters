@@ -50,6 +50,9 @@
     <ClCompile Include="inc\config.cpp">
       <Filter>ice</Filter>
     </ClCompile>
+    <ClCompile Include="src\DataCarrier.cpp">
+      <Filter>ice</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="inc\agent.h">
@@ -116,6 +119,9 @@
       <Filter>ice</Filter>
     </ClInclude>
     <ClInclude Include="inc\config.h">
+      <Filter>ice</Filter>
+    </ClInclude>
+    <ClInclude Include="inc\DataCarrier.h">
       <Filter>ice</Filter>
     </ClInclude>
   </ItemGroup>

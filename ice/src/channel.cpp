@@ -122,6 +122,14 @@ namespace ICE {
 
     int32_t UDPChannel::Recv(void *buffer, int32_t size, std::string &sender_ip, uint16_t &sender_port, bool /*framing*/) noexcept
     {
+        address addr;
+        auto bytes = Recv(buffer, size, addr, sender_port, false);
+        sender_ip = addr.to_string();
+        return bytes;
+    }
+
+    int32_t UDPChannel::Recv(void *buffer, int32_t size, boost::asio::ip::address &sender, uint16_t port, bool/*framing*/) noexcept
+    {
         boost::system::error_code error;
         udp::endpoint ep;
 
@@ -133,8 +141,8 @@ namespace ICE {
             return boost::asio::error::eof == error ? 0 : -1;
         }
 
-        sender_ip = ep.address().to_string();
-        sender_port = ep.port();
+        sender = ep.address();
+        port = ep.port();
         return bytes;
     }
 
@@ -154,14 +162,17 @@ namespace ICE {
 
     int32_t UDPChannel::Send(const void *buffer, int32_t size, const std::string &recver_ip, uint16_t recver_port, bool /*framing*/) noexcept
     {
+        return Send(buffer, size, address::from_string(recver_ip), recver_port,false);
+    }
+
+    int32_t UDPChannel::Send(const void *buffer, int32_t size, const boost::asio::ip::address &recver, uint16_t port, bool/*framing*/) noexcept
+    {
         boost::system::error_code error;
-        udp::endpoint ep(address::from_string(recver_ip), recver_port);
 
-        auto bytes = m_Socket.send_to(boost::asio::buffer(buffer, size), ep, 0, error);
-
+        auto bytes = m_Socket.send_to(boost::asio::buffer(buffer, size), boost::asio::ip::udp::endpoint(recver, port),0,error);
         if (error.value())
         {
-            LOG_ERROR("UDPChannel", "Send to [%s:%d] error :%d", recver_ip.c_str(), recver_port, error.value());
+            LOG_ERROR("UDPChannel", "Send to [%s:%d] error :%d", recver.to_string().c_str(), port, error.value());
             return boost::asio::error::eof == error ? 0 : -1;
         }
         return bytes;
@@ -301,10 +312,22 @@ namespace ICE {
         return bytes;
     }
 
-    int32_t TCPChannel::Recv(void *buffer, int32_t size, std::string& /*sender_ip*/, uint16_t&/*sender_port*/, bool framing /*= false*/) noexcept
+    int32_t TCPChannel::Recv(void *buffer, int32_t size, std::string& sender_ip, uint16_t& sender_port, bool framing /*= false*/) noexcept
     {
         assert(buffer && size);
-        return Recv(buffer, size, framing);
+        auto bytes = Recv(buffer, size, framing);
+        sender_ip = m_Socket.remote_endpoint().address().to_string();
+        sender_port = m_Socket.remote_endpoint().port();
+        return bytes;
+    }
+
+    int32_t TCPChannel::Recv(void *buffer, int32_t size, boost::asio::ip::address &sender, uint16_t port, bool framing) noexcept
+    {
+        auto bytes = Recv(buffer,size,framing);
+
+        sender = m_Socket.remote_endpoint().address();
+        port = m_Socket.remote_endpoint().port();
+        return bytes;
     }
 
     int32_t TCPChannel::Send(const void *buffer, int32_t size, bool framing /*=false*/) noexcept
@@ -335,6 +358,11 @@ namespace ICE {
     int32_t TCPChannel::Send(const void *buffer, int32_t size, const std::string &, uint16_t, bool framing /*=false*/) noexcept
     {
         assert(buffer && size);
+        return Send(buffer, size, framing);
+    }
+
+    int32_t TCPChannel::Send(const void *buffer, int32_t size, const boost::asio::ip::address &recver, uint16_t port, bool framing) noexcept
+    {
         return Send(buffer, size, framing);
     }
 

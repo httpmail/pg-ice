@@ -203,7 +203,7 @@ namespace STUN {
         }
     }
 
-    void MessagePacket::AddAttribute(const ATTR::Address32 & attr)
+    void MessagePacket::AddAttribute(const ATTR::AddressIPv4 & attr)
     {
         if (HasAttribute(attr.Type()))
         {
@@ -211,9 +211,9 @@ namespace STUN {
             return;
         }
 
-        static_assert(sizeof(ATTR::Address32) == 12, "address attribute MUST be 12 bytes");
+        static_assert(sizeof(ATTR::AddressIPv4) == 12, "address attribute MUST be 12 bytes");
 
-        auto pBuf = AllocAttribute(attr.Type(), sizeof(ATTR::Address32));
+        auto pBuf = AllocAttribute(attr.Type(), sizeof(ATTR::AddressIPv4));
         if (!pBuf)
         {
             LOG_ERROR("STUN-MSG", "Not enough memory for Attribute [%d]", attr.Type());
@@ -225,17 +225,17 @@ namespace STUN {
         reinterpret_cast<uint32_t*>(&pBuf[8])[0] = reinterpret_cast<const uint32_t*>(&source[8])[0];
     }
 
-    void MessagePacket::AddAttribute(const ATTR::XorMapped32 & attr)
+    void MessagePacket::AddAttribute(const ATTR::XorMappedIPv4 & attr)
     {
         if (HasAttribute(attr.Type()))
         {
-            LOG_WARNING("STUN-MSG", "XorMapped32 [%d] attribute already existed!", attr.Type());
+            LOG_WARNING("STUN-MSG", "XorMappedIPv4 [%d] attribute already existed!", attr.Type());
             return;
         }
 
-        static_assert(sizeof(ATTR::Address32) == 12, "XorMapped32 attribute MUST be 12 bytes");
+        static_assert(sizeof(ATTR::AddressIPv4) == 12, "XorMappedIPv4 attribute MUST be 12 bytes");
 
-        auto pBuf = AllocAttribute(attr.Type(), sizeof(ATTR::Address32));
+        auto pBuf = AllocAttribute(attr.Type(), sizeof(ATTR::AddressIPv4));
         if (!pBuf)
         {
             LOG_ERROR("STUN-MSG", "Not enough memory for Attribute [%d]", attr.Type());

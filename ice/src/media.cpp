@@ -1,5 +1,12 @@
 
 #include "media.h"
+
+#include "stundef.h"
+#include "session.h"
+#include "stream.h"
+
+#include "pg_log.h"
+
 namespace {
     static const std::string BASE64 =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -27,8 +34,8 @@ namespace {
 }
 
 namespace ICE {
-    ICE::Media::Media() :
-        m_icepwd(GenerateUserPwd()), m_iceufrag(GenerateUserFrag())
+    ICE::Media::Media(Session &session) :
+        m_Session(session), m_icepwd(GenerateUserPwd()), m_iceufrag(GenerateUserFrag())
     {
     }
 
@@ -47,14 +54,14 @@ namespace ICE {
     bool Media::CreateStream(uint8_t compId, Protocol protocol, const std::string& hostIP, uint16_t hostPort)
     {
 
-        std::auto_ptr<Stream> stream(new Stream(compId, protocol, hostIP, hostPort));
+        std::auto_ptr<Stream> stream(new Stream(m_Session, *this, compId, protocol, hostIP, hostPort));
         if (!stream.get())
         {
             LOG_ERROR("Media", "Not enough to Create Stream failed");
             return false;
         }
 
-        if(!stream->GatherCandidate())
+        if(!stream->GatherCandidates())
         {
             LOG_ERROR("Media", "Create Stream Failed to gather candidates");
             return false;

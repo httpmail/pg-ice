@@ -80,7 +80,7 @@ int main()
 
     auto& config = Configuration::Instance();
 
-    //config.AddStunServer("64.235.150.11",3478);
+    config.AddStunServer("64.235.150.11",3478);
     //config.AddStunServer("216.93.246.18", 3478);
     //config.AddStunServer("192.168.110.123", 3478);
 

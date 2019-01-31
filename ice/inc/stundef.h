@@ -165,10 +165,10 @@ namespace STUN {
         |                                                               |
         +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
         */
-        class Address32 : public Header {
+        class AddressIPv4 : public Header {
         public:
-            Address32(Id id) : Header(id, 8), m_Reserved(0), m_Family(static_cast<decltype(m_Family)>(AddressFamily::IPv4)){}
-            ~Address32() {}
+            AddressIPv4(Id id) : Header(id, 8), m_Reserved(0), m_Family(static_cast<decltype(m_Family)>(AddressFamily::IPv4)){}
+            ~AddressIPv4() {}
 
             uint16_t Port() const    { return PG::network_to_host<uint16_t>(m_Port); }
             void Port(uint16_t port) { m_Port = PG::host_to_network<uint16_t>(port); }
@@ -184,9 +184,9 @@ namespace STUN {
             unsigned m_Address  : 32;
         };
 
-        class MappedAddress : public Address32 {
+        class MappedAddress : public AddressIPv4 {
         public:
-            MappedAddress(Id id = Id::MappedAddress) : Address32(Id::MappedAddress) {}
+            MappedAddress(Id id = Id::MappedAddress) : AddressIPv4(Id::MappedAddress) {}
         };
 
         class ResponseAddress : public MappedAddress {
@@ -428,10 +428,10 @@ namespace STUN {
             uint8_t m_Nonce[0];
         };
 
-        class XorMapped32 : public Header{
+        class XorMappedIPv4 : public Header{
         public:
-            XorMapped32(Id id) : Header(id, 8), m_Reserved(0), m_Family(static_cast<decltype(m_Family)>(AddressFamily::IPv4)) {}
-            ~XorMapped32() {}
+            XorMappedIPv4(Id id) : Header(id, 8), m_Reserved(0), m_Family(static_cast<decltype(m_Family)>(AddressFamily::IPv4)) {}
+            ~XorMappedIPv4() {}
 
             uint16_t Port() const { return static_cast<uint16_t>((sMagicCookie >> 16) ^ PG::network_to_host<uint16_t>(m_Port)); }
             void Port(uint16_t port) { m_Port = PG::host_to_network<uint16_t>(port ^ (sMagicCookie >> 16)); }
@@ -440,6 +440,8 @@ namespace STUN {
             void Address(uint32_t address) { m_Address = PG::host_to_network<uint32_t>(address ^ sMagicCookie); }
             std::string IP() const { return boost::asio::ip::address_v4(Address()).to_string(); }
 
+            AddressFamily Family() const { return static_cast<AddressFamily>(m_Family);}
+
         protected:
             unsigned m_Reserved : 8;
             unsigned m_Family : 8;
@@ -447,14 +449,14 @@ namespace STUN {
             unsigned m_Address : 32;
         };
 
-        class XorMappedAddrSvr : public XorMapped32 {
+        class XorMappedAddrSvr : public XorMappedIPv4 {
         public:
-            XorMappedAddrSvr() : XorMapped32(Id::XorMappedSvr) {}
+            XorMappedAddrSvr() : XorMappedIPv4(Id::XorMappedSvr) {}
         };
 
-        class XorMappAddress : public XorMapped32 {
+        class XorMappAddress : public XorMappedIPv4 {
         public:
-            XorMappAddress() :XorMapped32(Id::XorMapped) {}
+            XorMappAddress() :XorMappedIPv4(Id::XorMapped) {}
         };
 
         class Software : public Header {

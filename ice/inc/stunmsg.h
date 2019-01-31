@@ -45,6 +45,11 @@ namespace STUN {
             return 0 == memcmp(other.m_StunPacket.TransId(), m_StunPacket.TransId(), sizeof(m_StunPacket.TransId()));
         }
 
+        bool IsTransIdEqual(const PACKET::stun_packet& other) const
+        {
+            return 0 == memcmp(other.TransId(), m_StunPacket.TransId(), sizeof(m_StunPacket.TransId()));
+        }
+
         TransIdConstRef TransationId() const
         {
             return m_StunPacket.TransId();
@@ -93,8 +98,8 @@ namespace STUN {
 
         const UnkonwnAttrContainer& GetUnkonwnAttrs() const { return m_UnkonwnAttrs; }
 
-        void AddAttribute(const ATTR::Address32 &attr);
-        void AddAttribute(const ATTR::XorMapped32 &attr);
+        void AddAttribute(const ATTR::AddressIPv4 &attr);
+        void AddAttribute(const ATTR::XorMappedIPv4 &attr);
         void AddAttribute(const ATTR::ChangeRequest &attr);
         void AddAttribute(const ATTR::Role &attr);
         void AddAttribute(const ATTR::Priority &attr);

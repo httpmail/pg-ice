@@ -1,12 +1,13 @@
 #pragma once
 
-#include <set>
-#include "stream.h"
+#include <map>
+#include "streamdef.h"
 
 namespace ICE {
 
     class CAgentConfig;
     class Stream;
+    class Session;
 
     class Media{
     public:
@@ -19,19 +20,25 @@ namespace ICE {
         using StreamContainer = std::map<uint16_t, Stream*>; /*key = component id*/
 
     public:
-        Media();
+        Media(Session &session);
         virtual ~Media();
 
         const StreamContainer& GetStreams() const { return m_Streams; }
         const Stream* GetStreamById(uint8_t id) const;
         const std::string& IcePwd() const { return m_icepwd; }
         const std::string& IceUfrag() const { return m_iceufrag; }
+
+        const std::string& RIcePwd() const   { return m_RIcepwd; }
+        const std::string& RIceUfrag() const { return m_RIcefrag; }
         bool CreateStream(uint8_t compId, Protocol protocol, const std::string& hostIP, uint16_t hostPort);
 
     private:
+        Session            &m_Session;
         StreamContainer     m_Streams;
         const std::string   m_icepwd;
         const std::string   m_iceufrag;
 
+        std::string m_RIcepwd;
+        std::string m_RIcefrag;
     };
 }
