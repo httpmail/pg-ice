@@ -38,7 +38,7 @@ namespace ICE {
         };
 
     public:
-        using MediaContainer    = std::map<std::string, const Media*>;
+        using MediaContainer    = std::map<std::string, Media*>;
         using CheckContainer    = std::map<StreamInfo, CandPeerContainer*>; /*key[@uint16_t component id]*/
 
     public:

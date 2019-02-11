@@ -257,7 +257,7 @@ namespace {
                 m_Id,
                 m_Session.IsControlling(),
                 m_Session.Tiebreaker(),
-                m_Media.RIceUfrag() + ":" + m_Media.RIceUfrag(),
+                m_Media.RIceUfrag() + ":" + m_Media.IceUfrag(),
                 m_Media.RIcePwd());
 
             if (!this->m_pMsg)
@@ -486,11 +486,12 @@ namespace {
                 considered to have failed.
                 */
                 LOG_ERROR("CheckSession", "found unkonwn-attributs, set transaction as failed");
+                m_SendCond.notify_one();
                 m_CallBack(false, *this, m_Peer);
             }
             else if (msg.GetAttribute(pXorMapAddr) &&
-                pXorMapAddr->IP() == m_Peer.RCandidate().m_BaseIP &&
-                pXorMapAddr->Port() == m_Peer.RCandidate().m_BasePort)
+                pXorMapAddr->IP() == m_Peer.LCandidate().m_BaseIP &&
+                pXorMapAddr->Port() == m_Peer.LCandidate().m_BasePort)
             {
                 /*
                 RFC5245 [7.1.3.1.  Failure Cases]
@@ -503,11 +504,18 @@ namespace {
                 symmetric.  If they are not symmetric, the agent sets the state of
                 the pair to Failed.
                 */
+                m_SendCond.notify_one();
                 m_CallBack(true, *this, m_Peer);
             }
             else
             {
-                LOG_ERROR("CheckSession", "No XormappAddress or no symmetric address");
+                if (pXorMapAddr)
+                {
+                    LOG_ERROR("CheckSession", "No XormappAddress or no symmetric address[%s:%d]",
+                        pXorMapAddr->IP().c_str(), pXorMapAddr->Port());
+                }
+
+                m_SendCond.notify_one();
                 m_CallBack(false, *this, m_Peer);
             }
         }
@@ -541,6 +549,7 @@ namespace {
                 there is no error code, invalid error resp message, set the status to failed
                 */
                 LOG_ERROR("CheckSession", "SubErrRespMsg has no error code");
+                m_SendCond.notify_one();
                 m_CallBack(false, *this, m_Peer);
             }
 
@@ -568,6 +577,7 @@ namespace {
                 additional information.
                 */
                 LOG_ERROR("CheckSession", "SubErrRespMsg,error code [%d]", errorCode);
+                m_SendCond.notify_one();
                 m_CallBack(false, *this, m_Peer);
             }
             else if (errorCode >= 500 && errorCode <= 599)
@@ -611,7 +621,7 @@ namespace ICE {
 
     bool Stream::GatherCandidates()
     {
-        assert(m_Status != Status::init);
+        assert(m_Status == Status::init);
         m_Status = Status::gathering;
 
         struct GatherSessInfo
@@ -772,7 +782,7 @@ namespace ICE {
 
     bool Stream::ConnectivityCheck(const CandPeerContainer & CandPeers)
     {
-        assert(CandPeers.size() && m_Status != Status::gatheringdone && m_CandChannels.size());
+        assert(CandPeers.size() && m_Status == Status::gatheringdone && m_CandChannels.size());
         m_Status = Status::checking;
 
         struct CheckSessCmp
@@ -792,23 +802,59 @@ namespace ICE {
                 auto & sessions = bRet ? m_PassedSessions : m_FailedSessions;
                 sessions.insert(&session);
 
-                if (bRet && m_NominatingSessions.empty() && *(*m_CheckSessions.begin()) < session)
+                if (bRet)
                 {
-                    session.Start(true, std::bind(&Delegate::OnCheckSessionNominating, this,
-                        std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
-
-                    m_NominatingSessions.insert(&session);
+                    auto highest_session = *m_CheckSessions.begin();
+                    if (m_NominatingSessions.empty() && (highest_session == &session || *highest_session < session))
+                    {
+                        LOG_INFO("Stream", "CheckSession, send 'use-candidate' bind request");
+                        m_NominatingSessions.insert(&session);
+                        session.Start(true, std::bind(&Delegate::OnCheckSessionNominating, this,
+                            std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+                    }
+                    else
+                        m_PassedSessions.insert(&session);
                 }
+                else
+                    m_FailedSessions.insert(&session);
 
-                if (m_CheckSessions.empty() && m_PassedSessions.empty() && m_NominatingSessions.empty())
+                m_CheckSessions.erase(&session);
+
+                if (m_CheckSessions.empty()
+                    && m_NominatingSessions.empty())
                 {
                     m_SessionCond.notify_one();
-                    return;
                 }
             }
 
             void OnCheckSessionNominating(bool bRet, CheckSession& session, const CandidatePeer& peer)
             {
+                std::lock_guard<decltype(m_checkMutex)> locker(m_checkMutex);
+                auto itor = m_NominatingSessions.find(&session);
+                assert(itor != m_NominatingSessions.end());
+                if (bRet)
+                {
+                    //cancel all session
+                    LOG_INFO("Stream", "Nominating has been done");
+                }
+                else if(m_CheckSessions.empty())
+                {
+                    m_FailedSessions.insert(&session);
+                    assert(m_CheckSessions.size() == (m_FailedSessions.size() + m_PassedSessions.size()));
+                    if (m_PassedSessions.empty())
+                    {
+                        LOG_ERROR("Stream", "Connectivity Check failed");
+                        m_SessionCond.notify_one();
+                        return;
+                    }
+                    else
+                    {
+                        auto n_session = *m_PassedSessions.begin();
+                        m_NominatingSessions.insert(n_session);
+                        n_session->Start(true, std::bind(&Delegate::OnCheckSessionNominating, this,
+                            std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+                    }
+                }
             }
 
             std::mutex &m_checkMutex;
@@ -907,16 +953,23 @@ namespace ICE {
 
         Delegate checkDelegate = { checkMutex, checkCond, checkSessions, failedSessions, passedSessions };
 
-        std::for_each(checkSessions.begin(), checkSessions.end(), [&checkDelegate](auto &itor) {
-            itor->Start(false, std::bind(&Delegate::OnCheckSessionDone,&checkDelegate,
+        for (auto itor = checkSessions.begin(); itor != checkSessions.end(); ++itor)
+        {
+            assert(*itor);
+            (*itor)->Start(false, std::bind(&Delegate::OnCheckSessionDone, &checkDelegate,
                 std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
-        });
-
+        }
         // wait session check done
         std::unique_lock<decltype(checkMutex)> locker(checkMutex);
         checkCond.wait(locker, [&checkSessions]() {
             return checkSessions.empty();
         });
+
+        while (1);
+        std::for_each(Carriers.begin(), Carriers.end(), [](auto &itor) {
+            delete itor.second;
+        });
+
         return true;
     }
 

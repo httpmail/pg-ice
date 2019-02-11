@@ -33,54 +33,9 @@ static std::string sOffer;
 
 int main() 
 {
-#if 0
-    boost::asio::ip::address addr = boost::asio::ip::address::from_string(config.DefaultIP());
-    boost::asio::ip::tcp::socket s1(sIOService);
-    boost::asio::ip::tcp::endpoint ep2(addr, 10000);
-
-    boost::system::error_code error;
-
-    s1.open(ep2.protocol());
-    s1.bind(ep2);
-
-    //s1.shutdown(boost::asio::socket_base::shutdown_both, error);
-    s1.close();
-    if (error.value())
-    {
-       // return -1;
-    }
-
-    boost::asio::ip::tcp::socket s2(sIOService);
-    s2.open(ep2.protocol());
-    s2.bind(ep2,error);
-    if (error.value())
-    {
-        std::cout << "s2 failed" << std::endl;
-        return -1;
-    }
-#endif
-
-#if 0
-    boost::asio::ip::tcp::socket s(sIOService);
-
-    boost::asio::ip::address localAddress = boost::asio::ip::address::from_string(config.DefaultIP());
-
-    boost::asio::ip::tcp::endpoint serverEp(localAddress, 3478);
-    s.connect(serverEp);
-
-    STUN::TransId id;
-    STUN::MessagePacket::GenerateRFC5389TransationId(id);
-    STUN::FirstBindReqMsg reqMsg(id);
-
-    s.send(boost::asio::buffer(reqMsg.GetData(), reqMsg.GetLength()));
-
-    char info[1024];
-    s.receive(boost::asio::buffer(info, sizeof(1024)));
-#endif
-
     auto& config = Configuration::Instance();
 
-    config.AddStunServer("64.235.150.11",3478);
+    //config.AddStunServer("64.235.150.11",3478);
     //config.AddStunServer("216.93.246.18", 3478);
     //config.AddStunServer("192.168.110.123", 3478);
 

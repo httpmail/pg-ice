@@ -694,8 +694,6 @@ namespace STUN {
 
     SubBindReqMsg::~SubBindReqMsg()
     {
-        int i = 0;
-        ++i;
     }
 
     void SubBindReqMsg::Finalize()

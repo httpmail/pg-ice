@@ -1,6 +1,7 @@
 #include "DataCarrier.h"
 #include "Channel.h"
 #include "pg_log.h"
+#include "stunmsg.h"
 
 namespace ICE {
 
@@ -18,16 +19,15 @@ namespace ICE {
 
     DataCarrier::~DataCarrier()
     {
-        assert(m_RecvListerners.size());
+        LOG_WARNING("DataCarrier", "Unregisterred listerner [%d]", m_RecvListerners.size());
 
-        {
-            std::lock_guard<decltype(m_QuitMutex)> locker(m_QuitMutex);
-            m_bQuit = true;
-        }
+        m_bQuit = true;
 
+        m_SendCond.notify_one();
         if (m_SendThrd.joinable())
             m_SendThrd.join();
 
+        m_RecvCond.notify_all();
         if (m_RecvThrd.joinable())
             m_RecvThrd.join();
 
@@ -55,16 +55,19 @@ namespace ICE {
 
     void DataCarrier::Start()
     {
-        std::lock_guard<decltype(m_StartedMutex)> locker(m_StartedMutex);
-        if (m_bStarted)
         {
-            LOG_WARNING("DataCarrier", "Already Started");
-            return;
+            std::lock_guard<decltype(m_StartedMutex)> locker(m_StartedMutex);
+            if (m_bStarted)
+            {
+                LOG_WARNING("DataCarrier", "Already Started");
+                return;
+            }
         }
 
         m_bStarted = true;
         m_SendThrd = std::thread(SendThread, this);
         m_RecvThrd = std::thread(RecvThread, this);
+        m_HandThrd = std::thread(HandleRecvPacketsThread, this);
         return;
     }
 
@@ -80,9 +83,12 @@ namespace ICE {
         memcpy(&packet->m_packet, data, size);
         packet->m_Address.address = boost::asio::ip::address::from_string(dest);
         packet->m_Address.port = port;
+        packet->m_size = size;
 
-        std::lock_guard<decltype(m_SendMutex)> sendLocker(m_SendMutex);
-        m_SendPackets.push(packet);
+        {
+            std::lock_guard<decltype(m_SendMutex)> sendLocker(m_SendMutex);
+            m_SendPackets.push(packet);
+        }
         m_SendCond.notify_one();
 
         return true;
@@ -111,12 +117,6 @@ namespace ICE {
         return true;
     }
 
-    bool DataCarrier::IsQuit() const
-    {
-        std::lock_guard<decltype(m_QuitMutex)> locker(m_QuitMutex);
-        return m_bQuit;
-    }
-
     bool DataCarrier::Initilize()
     {
         std::lock_guard<decltype(sFreePacketsMutex)> locker(sFreePacketsMutex);
@@ -134,20 +134,30 @@ namespace ICE {
     {
         assert(pThis);
 
-        while (!pThis->IsQuit())
+        while (!pThis->m_bQuit)
         {
-            std::unique_lock<decltype(pThis->m_SendMutex)> locker(pThis->m_SendMutex);
-            pThis->m_SendCond.wait(locker, [pThis]() {
-                return pThis->m_SendPackets.size() > 0;
-            });
+            Packet *packet(nullptr);
+            {
+                std::unique_lock<decltype(pThis->m_SendMutex)> locker(pThis->m_SendMutex);
+                pThis->m_SendCond.wait(locker, [pThis]() {
+                    return pThis->m_SendPackets.size() > 0 || pThis->m_bQuit;
+                });
 
-            // send the front packet
-            auto packet = pThis->m_SendPackets.front();
-            pThis->m_SendPackets.pop();
-            locker.release();
+                // send the front packet
+                if (pThis->m_bQuit)
+                {
+                    while (pThis->m_SendPackets.size())
+                    {
+                        Dealloc(pThis->m_SendPackets.front());
+                        pThis->m_SendPackets.pop();
+                    }
+                    break;
+                }
+                packet = pThis->m_SendPackets.front();
+                pThis->m_SendPackets.pop();
+            }
 
             pThis->m_Channel.Send(&packet->m_packet, packet->m_size, packet->m_Address.address, packet->m_Address.port, true);
-
             Dealloc(packet);
         }
     }
@@ -156,18 +166,30 @@ namespace ICE {
     {
         assert(pThis);
 
-        while (!pThis->IsQuit())
+        while (!pThis->m_bQuit)
         {
             auto packet = AllocPacket();
             auto bytes = pThis->m_Channel.Recv(&packet->m_packet, sizeof(packet->m_packet),
                 packet->m_Address.address,
                 packet->m_Address.port, true);
 
+
             if (bytes > 0)
             {
-                std::lock_guard<decltype(pThis->m_RecvMutex)> recvLocker(pThis->m_RecvMutex);
-                pThis->m_RecvPackets.push(packet);
+                if (STUN::MessagePacket::IsValidStunPacket(packet->m_packet, bytes))
+                {
+                        LOG_INFO("DataCarrier", "%d, %x", packet->m_Address.port, packet->m_packet.MsgId());
+                }
+                {
+                    packet->m_size = bytes;
+                    std::lock_guard<decltype(pThis->m_RecvMutex)> recvLocker(pThis->m_RecvMutex);
+                    pThis->m_RecvPackets.push(packet);
+                }
                 pThis->m_RecvCond.notify_one();
+            }
+            else
+            {
+                Dealloc(packet);
             }
         }
     }
@@ -176,20 +198,31 @@ namespace ICE {
     {
         assert(pThis);
 
-        while (!pThis->IsQuit())
+        while (!pThis->m_bQuit)
         {
-            std::unique_lock<decltype(pThis->m_RecvMutex)> locker(pThis->m_RecvMutex);
+            Packet *packet(nullptr);
+            {
+                std::unique_lock<decltype(pThis->m_RecvMutex)> locker(pThis->m_RecvMutex);
 
-            pThis->m_RecvCond.wait(locker, [pThis]() {
-                return pThis->m_RecvPackets.size() > 0;
-            });
-
-            auto packet = pThis->m_RecvPackets.front();
-            pThis->m_RecvPackets.pop();
-            locker.release();
+                pThis->m_RecvCond.wait(locker, [pThis]() {
+                    return pThis->m_RecvPackets.size() > 0 || pThis->m_bQuit;
+                });
+                if (pThis->m_bQuit)
+                {
+                    while (pThis->m_RecvPackets.size())
+                    {
+                        Dealloc(pThis->m_RecvPackets.front());
+                        pThis->m_RecvPackets.pop();
+                    }
+                    break;
+                }
+                packet = pThis->m_RecvPackets.front();
+                pThis->m_RecvPackets.pop();
+            }
 
             auto listerner_itor = pThis->m_RecvListerners.find(packet->m_Address);
             assert(listerner_itor->second);
+            LOG_INFO("DataCarrier", "%p ", listerner_itor);
             listerner_itor->second(&packet->m_packet, packet->m_size);
 
             Dealloc(packet);

@@ -79,16 +79,14 @@ namespace ICE {
         std::thread   m_HandThrd;
 
         Buffer                  m_SendPackets;
-        mutable std::mutex      m_SendMutex;
+        std::mutex      m_SendMutex;
         std::condition_variable m_SendCond;
 
         Buffer                  m_RecvPackets;
         mutable std::mutex      m_RecvMutex;
         std::condition_variable m_RecvCond;
 
-        mutable std::mutex  m_QuitMutex;
-        bool                m_bQuit;
-
+        std::atomic_bool        m_bQuit;
         std::mutex m_StartedMutex;
         bool m_bStarted;
 

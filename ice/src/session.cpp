@@ -218,6 +218,9 @@ namespace ICE {
                 }
                 candPeerContainer.release();
             }
+
+            lmedia->SetRIcePwd(rmedia->IcePassword());
+            lmedia->SetRIceUfrag(rmedia->IceUfrag());
         }
 
         if (total_cand_pairs == 0 || total_cand_pairs > Configuration::Instance().CandPairsLimits())

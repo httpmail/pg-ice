@@ -29,7 +29,10 @@ namespace ICE {
         const std::string& IceUfrag() const { return m_iceufrag; }
 
         const std::string& RIcePwd() const   { return m_RIcepwd; }
+        void SetRIcePwd(const std::string& pwd) { m_RIcepwd = pwd; }
+
         const std::string& RIceUfrag() const { return m_RIcefrag; }
+        void SetRIceUfrag(const std::string& ufrag) { m_RIcefrag = ufrag; }
         bool CreateStream(uint8_t compId, Protocol protocol, const std::string& hostIP, uint16_t hostPort);
 
     private:

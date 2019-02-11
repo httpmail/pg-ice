@@ -128,7 +128,7 @@ namespace ICE {
         return bytes;
     }
 
-    int32_t UDPChannel::Recv(void *buffer, int32_t size, boost::asio::ip::address &sender, uint16_t port, bool/*framing*/) noexcept
+    int32_t UDPChannel::Recv(void *buffer, int32_t size, boost::asio::ip::address &sender, uint16_t &port, bool/*framing*/) noexcept
     {
         boost::system::error_code error;
         udp::endpoint ep;
@@ -321,7 +321,7 @@ namespace ICE {
         return bytes;
     }
 
-    int32_t TCPChannel::Recv(void *buffer, int32_t size, boost::asio::ip::address &sender, uint16_t port, bool framing) noexcept
+    int32_t TCPChannel::Recv(void *buffer, int32_t size, boost::asio::ip::address &sender, uint16_t &port, bool framing) noexcept
     {
         auto bytes = Recv(buffer,size,framing);
 
