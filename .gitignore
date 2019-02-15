@@ -4,3 +4,7 @@ ice/abc.log
 ice/x64/
 *.user
 .vs/
+*.opendb
+*.db
+ice.VC.db
+ice.VC.db

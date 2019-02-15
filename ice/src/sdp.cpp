@@ -234,7 +234,7 @@ bool CSDP::Decode(const std::string & offer)
     return true;
 }
 
-bool CSDP::Encode(const ICE::Session & session, std::string& offer)
+bool CSDP::EncodeOffer(const ICE::Session & session, std::string& offer)
 {
     auto Medias = session.GetMedias();
     assert(Medias.size());
@@ -340,6 +340,51 @@ bool CSDP::Encode(const ICE::Session & session, std::string& offer)
 
     offer = offer_stream.str();
     return offer.length() > 0;
+}
+
+bool CSDP::EncodeAnswer(const ICE::Session & session, const std::string & offer, std::string & answer)
+{
+    answer = offer;
+
+    for (auto media_itor = session.GetMedias().begin(); media_itor != session.GetMedias().end(); ++media_itor)
+    {
+        assert(media_itor->second);
+        auto media = media_itor->second;
+
+        std::ostringstream remote_line;
+
+        remote_line << SDPDEF::remotecand_line;
+
+        for (auto stream_itor = media->GetStreams().begin(); stream_itor != media->GetStreams().end(); ++stream_itor)
+        {
+            assert(stream_itor->second);
+            auto stream = stream_itor->second;
+            auto ip = stream->GetRemoteCandidateIP();
+            auto port = stream->GetRemoteCandidatePort();
+
+            remote_line << stream_itor->first << " ";
+            remote_line << ip << " ";
+            remote_line << port << " ";
+        }
+
+        std::string remote = remote_line.str();
+        // trim space from the end
+        remote.pop_back();
+
+        auto pos = offer.find(media_itor->first);
+        assert(pos != std::string::npos);
+
+        auto nxt_media = offer.find(SDPDEF::m_line, pos);
+        if (std::string::npos == nxt_media)
+            answer.append(remote);
+        else
+        {
+            remote += SDPDEF::CRLF;
+            answer.insert(nxt_media, remote);
+        }
+    }
+
+    return true;
 }
 
 CSDP::RemoteMedia* CSDP::DecodeMediaLine(const std::string & mediaLine, bool bSesUfragPwdExisted)

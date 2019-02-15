@@ -55,6 +55,7 @@ namespace {
 
 Configuration::Configuration() :
     m_LocalPref(0xFFFF),
+    m_Tr(sDefaultTr),
     m_RTO(sDefaultRTO),
     m_Ta(sDefaultTa),
     m_Rm(sDefaultRm),

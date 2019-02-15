@@ -175,7 +175,7 @@ namespace ICE{
             break;
 
         case Channel::ShutdownOption::Both:
-            s.shutdown(boost::asio::socket_base::shutdown_send, error);
+            s.shutdown(boost::asio::socket_base::shutdown_both, error);
             break;
         default:
             break;

@@ -91,7 +91,7 @@ namespace ICE {
     void Session::SetControlling(bool bControlling)
     {
         std::lock_guard<decltype(m_ControllingMutex)> locker(m_ControllingMutex);
-        bControlling = bControlling;
+        m_bControlling = bControlling;
     }
 
     bool Session::IsControlling() const
@@ -233,16 +233,25 @@ namespace ICE {
         }
 
         // connectivity check
+        using Threads = std::vector<std::thread>;
+        Threads ConnCheckThrds;
         for (auto check_itor = m_CheckList.begin(); check_itor != m_CheckList.end(); ++check_itor)
         {
             assert(check_itor->second);
 
-            m_ConnCheckThrds.push_back(std::thread(ConnectivityCheckThread, this, &check_itor->first, check_itor->second));
+            ConnCheckThrds.push_back(std::thread(ConnectivityCheckThread, this, &check_itor->first, check_itor->second));
 
             std::mutex mutex;
             std::unique_lock<decltype(mutex)> locker(mutex);
             m_ConnCheckCond.wait_for(locker, std::chrono::milliseconds(Configuration::Instance().Ta()));
         }
+
+        // wait all checking done
+
+        std::for_each(ConnCheckThrds.begin(), ConnCheckThrds.end(), [](auto &itor) {
+            if (itor.joinable())
+                itor.join();
+        });
 
         return true;
     }
@@ -250,12 +259,21 @@ namespace ICE {
     bool Session::MakeOffer(std::string & offer)
     {
         CSDP sdp;
-        return sdp.Encode(*this, offer);
+        auto ret = sdp.EncodeOffer(*this, m_Offer);
+        offer = m_Offer;
+        return ret;
     }
 
     bool Session::MakeAnswer(const std::string & remoteOffer, std::string & answer)
     {
-        return true;
+        auto ret = ConnectivityCheck(remoteOffer);
+        if (!ret)
+            return false;
+
+        CSDP sdp;
+        ret = sdp.EncodeAnswer(*this, m_Offer, m_Answer);
+        answer = m_Answer;
+        return ret;
     }
 
     void Session::ConnectivityCheckThread(Session * pThis, const StreamInfo* streamInfo, CandPeerContainer * peers)

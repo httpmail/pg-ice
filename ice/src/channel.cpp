@@ -189,12 +189,12 @@ namespace ICE {
             LOG_ERROR("UDPChannel", "Connect to [%s, %d], error :%d", dest.c_str(), port, error.value());
             return false;
         }
-
         return true;
     }
 
     bool UDPChannel::Shutdown(ShutdownOption op) noexcept
     {
+        LOG_ERROR("xxx", "Shutdown [%p]", this);
         return Channel::Shutdown(m_Socket, op);
     }
 

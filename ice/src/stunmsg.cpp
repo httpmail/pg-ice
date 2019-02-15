@@ -663,6 +663,11 @@ namespace STUN {
         assert(packet.MsgId() == MsgType::BindingRequest);
     }
 
+    void FirstBindReqMsg::Finalize()
+    {
+        m_StunPacket.Length(m_AttrLength);
+    }
+
     ////////////////////////////// FirstBindRespMsg //////////////////////////////
     FirstBindRespMsg::FirstBindRespMsg(const PACKET::stun_packet & packet, uint16_t packet_size) :
         MessagePacket(packet, packet_size)
@@ -740,5 +745,22 @@ namespace STUN {
     void SubBindErrRespMsg::Finalize()
     {
     }
-}
 
+    void IndicationMsg::Finalize()
+    {
+        boost::crc_32_type crc32_result;
+        crc32_result.process_bytes(&m_StunPacket, m_AttrLength + STUN::sStunHeaderLength);
+        uint32_t crc32 = crc32_result.checksum() ^ sStunXorFingerprint;
+
+        // add fingerprint to packet
+        auto pBuf = AllocAttribute(STUN::ATTR::Id::Fingerprint, sizeof(ATTR::Fingerprint));
+        assert(pBuf);
+        reinterpret_cast<uint16_t*>(pBuf)[0] = PG::host_to_network(static_cast<uint16_t>(ATTR::Id::Fingerprint));
+        reinterpret_cast<uint16_t*>(pBuf)[1] = PG::host_to_network(static_cast<uint16_t>(sizeof(ATTR::Fingerprint) - sizeof(ATTR::Header)));
+
+        auto pFigerprint = reinterpret_cast<ATTR::Fingerprint*>(pBuf);
+        pFigerprint->CRC32(crc32);
+
+        m_StunPacket.Length(m_AttrLength);
+    }
+}

@@ -42,7 +42,7 @@ namespace ICE {
         using CheckContainer    = std::map<StreamInfo, CandPeerContainer*>; /*key[@uint16_t component id]*/
 
     public:
-        Session(const std::string& sessionName = "-", const std::string& userName = "-");
+        explicit Session(const std::string& sessionName = "-", const std::string& userName = "-");
         virtual ~Session();
 
         void SetControlling(bool bControlling = true);
@@ -64,13 +64,10 @@ namespace ICE {
         static void ConnectivityCheckThread(Session * pThis, const StreamInfo* streamInfo, CandPeerContainer * peers);
 
     private:
-        using Threads = std::vector<std::thread>;
-
-    private:
-
         std::condition_variable m_ConnCheckCond;
-        Threads                 m_ConnCheckThrds;
 
+        std::string m_Offer;
+        std::string m_Answer;
         MediaContainer m_Medias;
         CheckContainer m_CheckList;
 
@@ -83,7 +80,7 @@ namespace ICE {
         const uint64_t m_Tiebreaker;     /* rfc8445 16.1 */
         const std::string m_DefaultIP;
 
-        mutable std::mutex  m_ControllingMutex;
-        bool                m_bControlling;
+        mutable std::mutex m_ControllingMutex;
+        bool m_bControlling;
     };
 }

@@ -19,11 +19,11 @@ namespace ICE {
 
     DataCarrier::~DataCarrier()
     {
-        LOG_WARNING("DataCarrier", "Unregisterred listerner [%d]", m_RecvListerners.size());
+        LOG_WARNING("DataCarrier", "Unregisterred listerner [%d] [%p] [%p]", m_RecvListener.size(), this, &m_Channel);
 
         m_bQuit = true;
 
-        m_SendCond.notify_one();
+         m_SendCond.notify_one();
         if (m_SendThrd.joinable())
             m_SendThrd.join();
 
@@ -31,6 +31,7 @@ namespace ICE {
         if (m_RecvThrd.joinable())
             m_RecvThrd.join();
 
+        m_RecvCond.notify_all();
         if (m_HandThrd.joinable())
             m_HandThrd.join();
 
@@ -51,6 +52,8 @@ namespace ICE {
                 m_RecvPackets.pop();
             }
         }
+
+        LOG_INFO("DataCarrier", "sFreePackets [%d], total [%d]", sFreePackets.size(), DataCarrier::sPacketCacheSize);
     }
 
     void DataCarrier::Start()
@@ -89,7 +92,7 @@ namespace ICE {
             std::lock_guard<decltype(m_SendMutex)> sendLocker(m_SendMutex);
             m_SendPackets.push(packet);
         }
-        m_SendCond.notify_one();
+         m_SendCond.notify_one();
 
         return true;
     }
@@ -99,13 +102,15 @@ namespace ICE {
         using namespace boost::asio::ip;
         TransportAddress address = { address::from_string(target), port };
 
-        auto itor = m_RecvListerners.find(address);
-        if (itor != m_RecvListerners.end())
+        std::lock_guard<decltype(m_ListenerMutex)> locker(m_ListenerMutex);
+        auto itor = m_RecvListener.find(address);
+        if (itor != m_RecvListener.end())
         {
             LOG_WARNING("DataCarrier", "Register, already registered [%s:%d]", target.c_str(), port);
             return false;
         }
-        return m_RecvListerners.insert(std::make_pair(address, recvCallback)).second;
+
+        return m_RecvListener.insert(std::make_pair(address, recvCallback)).second;
     }
 
     bool DataCarrier::Unregister(const std::string & target, uint16_t port)
@@ -113,8 +118,15 @@ namespace ICE {
         using namespace boost::asio::ip;
         TransportAddress address = { address::from_string(target), port };
 
-        m_RecvListerners.erase(address);
+        std::lock_guard<decltype(m_ListenerMutex)> locker(m_ListenerMutex);
+        m_RecvListener.erase(address);
         return true;
+    }
+
+    void DataCarrier::Unregister()
+    {
+        std::lock_guard<decltype(m_ListenerMutex)> locker(m_ListenerMutex);
+        m_RecvListener.clear();
     }
 
     bool DataCarrier::Initilize()
@@ -145,14 +157,8 @@ namespace ICE {
 
                 // send the front packet
                 if (pThis->m_bQuit)
-                {
-                    while (pThis->m_SendPackets.size())
-                    {
-                        Dealloc(pThis->m_SendPackets.front());
-                        pThis->m_SendPackets.pop();
-                    }
                     break;
-                }
+
                 packet = pThis->m_SendPackets.front();
                 pThis->m_SendPackets.pop();
             }
@@ -173,18 +179,11 @@ namespace ICE {
                 packet->m_Address.address,
                 packet->m_Address.port, true);
 
-
             if (bytes > 0)
             {
-                if (STUN::MessagePacket::IsValidStunPacket(packet->m_packet, bytes))
-                {
-                        LOG_INFO("DataCarrier", "%d, %x", packet->m_Address.port, packet->m_packet.MsgId());
-                }
-                {
-                    packet->m_size = bytes;
-                    std::lock_guard<decltype(pThis->m_RecvMutex)> recvLocker(pThis->m_RecvMutex);
-                    pThis->m_RecvPackets.push(packet);
-                }
+                packet->m_size = bytes;
+                std::lock_guard<decltype(pThis->m_RecvMutex)> recvLocker(pThis->m_RecvMutex);
+                pThis->m_RecvPackets.push(packet);
                 pThis->m_RecvCond.notify_one();
             }
             else
@@ -201,30 +200,36 @@ namespace ICE {
         while (!pThis->m_bQuit)
         {
             Packet *packet(nullptr);
+
             {
                 std::unique_lock<decltype(pThis->m_RecvMutex)> locker(pThis->m_RecvMutex);
 
                 pThis->m_RecvCond.wait(locker, [pThis]() {
                     return pThis->m_RecvPackets.size() > 0 || pThis->m_bQuit;
                 });
+
                 if (pThis->m_bQuit)
-                {
-                    while (pThis->m_RecvPackets.size())
-                    {
-                        Dealloc(pThis->m_RecvPackets.front());
-                        pThis->m_RecvPackets.pop();
-                    }
                     break;
-                }
+
                 packet = pThis->m_RecvPackets.front();
                 pThis->m_RecvPackets.pop();
             }
 
-            auto listerner_itor = pThis->m_RecvListerners.find(packet->m_Address);
-            assert(listerner_itor->second);
-            LOG_INFO("DataCarrier", "%p ", listerner_itor);
-            listerner_itor->second(&packet->m_packet, packet->m_size);
-
+            {
+                std::lock_guard<decltype(pThis->m_ListenerMutex)> locker(pThis->m_ListenerMutex);
+                auto listerner_itor = pThis->m_RecvListener.find(packet->m_Address);
+                if (listerner_itor != pThis->m_RecvListener.end())
+                {
+                    assert(listerner_itor->second);
+                    listerner_itor->second(&packet->m_packet, packet->m_size);
+                }
+                else
+                {
+                    LOG_WARNING("DataCarrier","unexcepted sender [%s:%d]",
+                        boost::asio::ip::address(packet->m_Address.address).to_string().c_str(),
+                        packet->m_Address.port);
+                }
+            }
             Dealloc(packet);
         }
     }

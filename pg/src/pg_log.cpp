@@ -49,6 +49,7 @@ namespace PG {
         assert(file_path && pFormat && levelInfo);
         try
         {
+#if 1
             thread_local std::shared_ptr<TLSContainer> Buffer(new TLSContainer);
 
             auto& buffer = Buffer->Lock4Write();
@@ -73,6 +74,19 @@ namespace PG {
             va_end(argp);
 
             m_LogCond.notify_one();
+#else
+            static char buf[4096 + 4096];
+            std::lock_guard<decltype(m_LogMutex)> locker(m_LogMutex);
+            boost::filesystem::path full_path(file_path, boost::filesystem::native);
+            auto head_len = sprintf_s(buf, sizeof(buf), "[%s]: %s(%d) : ", levelInfo, full_path.filename().string().c_str(), line);
+            auto remain_buffer_bytes = sizeof(buf) - head_len;
+            va_list argp;
+
+            va_start(argp, pFormat);
+            auto real_bytes = vsnprintf(&buf[head_len], remain_buffer_bytes, pFormat, argp);
+            va_end(argp);
+            std::cout << buf << std::endl;
+#endif
         }
         catch (const std::exception &)
         {

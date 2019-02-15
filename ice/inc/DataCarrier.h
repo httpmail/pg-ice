@@ -46,6 +46,7 @@ namespace ICE {
         bool Send(const void *data, uint32_t size, const std::string &dest, uint16_t port);
         bool Register(const std::string& target, uint16_t port, RecvCallBack recvCallback);
         bool Unregister(const std::string& target, uint16_t port);
+        void Unregister();
 
     private:
         bool IsQuit() const;
@@ -63,7 +64,7 @@ namespace ICE {
     private:
         static const uint16_t sPacketCacheSize = 256;
         using Buffer = std::queue<Packet*>;
-        using RecvListerners = std::map<TransportAddress, RecvCallBack>;
+        using RecvListener = std::map<TransportAddress, RecvCallBack>;
 
     private:
         static std::condition_variable sFreePacketsCond;
@@ -79,7 +80,7 @@ namespace ICE {
         std::thread   m_HandThrd;
 
         Buffer                  m_SendPackets;
-        std::mutex      m_SendMutex;
+        std::mutex              m_SendMutex;
         std::condition_variable m_SendCond;
 
         Buffer                  m_RecvPackets;
@@ -87,9 +88,10 @@ namespace ICE {
         std::condition_variable m_RecvCond;
 
         std::atomic_bool        m_bQuit;
-        std::mutex m_StartedMutex;
-        bool m_bStarted;
+        std::mutex              m_StartedMutex;
+        bool                    m_bStarted;
 
-        RecvListerners m_RecvListerners;
+        std::mutex     m_ListenerMutex;
+        RecvListener   m_RecvListener;
     };
 }

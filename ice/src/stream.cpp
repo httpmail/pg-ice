@@ -10,8 +10,9 @@ namespace {
     using namespace ICE;
     using TimeoutContainer = std::vector<uint32_t>;
 
-    static TimeoutContainer sUDPTimeout = { 500, 1000,2000,4000,8000 };// { 500, 1000, 2000, 4000, 8000, 16000, 8000 };
+    static TimeoutContainer sUDPTimeout = { 500, 800, 800};//{ 500, 1000, 2000, 4000, 8000, 16000, 8000 };
     static TimeoutContainer sTCPTimeout = { 39500 };
+    static const uint16_t sNominatingTimeout = 10; // 10 seconds
 
     Candidate * CreateSvrCandidate(Protocol protocol,
         uint16_t compid,
@@ -40,8 +41,8 @@ namespace {
 
     Candidate * CreateHostCandidate(Protocol protocol, uint16_t compid, const std::string & connIP, uint16_t connPort)
     {
-        auto pri = Candidate::ComputePriority(Candidate::CandType::svr_ref, Configuration::Instance().LocalPref(), compid);
-        auto foundation = Candidate::ComputeFoundations(Candidate::CandType::svr_ref, connIP, connIP, protocol);
+        auto pri = Candidate::ComputePriority(Candidate::CandType::host, Configuration::Instance().LocalPref(), compid);
+        auto foundation = Candidate::ComputeFoundations(Candidate::CandType::host, connIP, connIP, protocol);
 
         switch (protocol)
         {
@@ -234,7 +235,13 @@ namespace {
     //////////////////////////// class CheckSession ///////////////////////////////////////
     class CheckSession {
     public:
-        using Callback = std::function<void(bool, CheckSession&, const ICE::CandidatePeer &peer)>;
+        enum class Status {
+            failed,
+            passed,
+            nominated,
+        };
+    public:
+        using Callback = std::function<void(Status, CheckSession&, const ICE::CandidatePeer &peer)>;
 
     public:
         CheckSession(ICE::Session &sess, ICE::Media &media, DataCarrier &dataCarrier, const ICE::CandidatePeer &peer, const TimeoutContainer &timer) :
@@ -243,7 +250,9 @@ namespace {
             STUN::MessagePacket::GenerateRFC5389TransationId(m_Id);
         }
 
-        virtual ~CheckSession() {}
+        virtual ~CheckSession() 
+        {
+        }
 
     public:
         void Start(bool bNominating, Callback callback)
@@ -251,8 +260,8 @@ namespace {
             assert(callback);
 
             std::lock_guard<decltype(m_pMsgMutex)> locker(m_pMsgMutex);
-            m_CallBack = callback;
 
+            m_Callback = callback;
             m_pMsg = new STUN::SubBindReqMsg(m_Peer.LCandidate().m_Priority,
                 m_Id,
                 m_Session.IsControlling(),
@@ -262,7 +271,7 @@ namespace {
 
             if (!this->m_pMsg)
             {
-                callback(false, *this, m_Peer);
+                m_Callback(Status::failed, *this, m_Peer);
                 return;
             }
 
@@ -283,8 +292,9 @@ namespace {
             if (m_Peer.Priority() == other.m_Peer.Priority())
                 return this < &other;
             else
-                return m_Peer.Priority() < other.m_Peer.Priority();
+                return m_Peer.Priority() > other.m_Peer.Priority();
         }
+
         void OnDataCarrierRecved(const void *pData, uint32_t bytes)
         {
             assert(pData && bytes);
@@ -325,6 +335,7 @@ namespace {
             }
         }
 
+        const ICE::CandidatePeer& GetCandPeer() const { return m_Peer; }
     private:
         static void SendThread(CheckSession *pThis)
         {
@@ -333,8 +344,9 @@ namespace {
             std::mutex send_mutex;
 
             auto & receiver = pThis->m_Peer.RCandidate().m_ConnIP;
-            auto port = pThis->m_Peer.RCandidate().m_ConnPort;
-            bool bTimeout = true;
+            auto port       = pThis->m_Peer.RCandidate().m_ConnPort;
+            bool bTimeout       = true;
+            pThis->m_bWaitResp  = true;
 
             for (auto itor = pThis->m_Timer.begin(); itor != pThis->m_Timer.end(); ++itor)
             {
@@ -343,11 +355,22 @@ namespace {
                     pThis->m_Carrier.Send(pThis->m_pMsg->GetData(), pThis->m_pMsg->GetLength(), receiver, port);
                 }
 
-                std::unique_lock<decltype(send_mutex)> locker(send_mutex);
-                if (std::cv_status::no_timeout == pThis->m_SendCond.wait_for(locker, std::chrono::milliseconds(*itor)))
+                try
                 {
-                    bTimeout = false;
-                    break;
+                    std::unique_lock<decltype(send_mutex)> locker(send_mutex);
+                    auto ret = pThis->m_SendCond.wait_for(locker, std::chrono::milliseconds(*itor), [pThis]() {
+                        return !pThis->m_bWaitResp;
+                    });
+
+                    if (ret)
+                    {
+                        bTimeout = false;
+                        break;
+                    }
+                }
+                catch (const std::exception& e)
+                {
+                    LOG_ERROR("CheckSession", "SendThread wait_for() exception [%s]", e.what());
                 }
             }
 
@@ -357,7 +380,7 @@ namespace {
                     pThis->m_Peer.LCandidate().m_BaseIP.c_str(), pThis->m_Peer.LCandidate().m_BasePort,
                     pThis->m_Peer.RCandidate().m_ConnIP.c_str(), pThis->m_Peer.RCandidate().m_BasePort);
 
-                pThis->m_CallBack(false, *pThis, pThis->m_Peer);
+                pThis->m_Callback(Status::failed, *pThis, pThis->m_Peer);
                 return;
             }
         }
@@ -374,16 +397,14 @@ namespace {
             if (!msg.GetAttribute(pRole) && !msg.GetAttribute(pPriority))
             {
                 LOG_WARNING("CheckSession", "Reqeust Message has no role or priority attribute");
-                m_SendCond.notify_one();
-                m_CallBack(false, *this, m_Peer);
+                m_Callback(Status::failed, *this, m_Peer);
                 return;
             }
 
             if (m_Session.IsControlling() && msg.GetAttribute(pUseCandidate))
             {
                 LOG_WARNING("CheckSession", "ice-controlling received use-candidate request");
-                m_SendCond.notify_one();
-                m_CallBack(false, *this, m_Peer);
+                m_Callback(Status::failed, *this, m_Peer);
                 return;
             }
 
@@ -401,8 +422,7 @@ namespace {
                     SubBindErrRespMsg errRespMsg(msg.TransationId(), 4, 0, "bad-request");
                     errRespMsg.Finalize();
                     m_Carrier.Send(errRespMsg.GetData(), errRespMsg.GetLength(),receiver, port);
-                    m_SendCond.notify_one();
-                    m_CallBack(false, *this, m_Peer);
+                    m_Callback(Status::failed, *this, m_Peer);
                 }
                 else if ((m_Media.IceUfrag() + ":" + m_Media.RIceUfrag()) != pUsername->Name())
                 {
@@ -410,7 +430,7 @@ namespace {
                     SubBindErrRespMsg errRespMsg(msg.TransationId(), 4, 1, "unmatched-username");
                     errRespMsg.Finalize();
                     m_Carrier.Send(errRespMsg.GetData(), errRespMsg.GetLength(), receiver, port);
-                    m_CallBack(false, *this, m_Peer);
+                    m_Callback(Status::failed, *this, m_Peer);
                 }
                 else if (!MessagePacket::VerifyMsgIntegrity(msg, m_Media.IcePwd()))
                 {
@@ -418,7 +438,7 @@ namespace {
                     SubBindErrRespMsg errRespMsg(msg.TransationId(), 4, 1, "unmatched-MsgIntegrity");
                     errRespMsg.Finalize();
                     m_Carrier.Send(errRespMsg.GetData(), errRespMsg.GetLength(), receiver, port);
-                    m_CallBack(false, *this, m_Peer);
+                    m_Callback(Status::failed, *this, m_Peer);
                 }
                 else if (msg.GetUnkonwnAttrs().size())
                 {
@@ -426,7 +446,7 @@ namespace {
                     errRespMsg.AddUnknownAttributes(msg.GetUnkonwnAttrs());
                     errRespMsg.Finalize();
                     m_Carrier.Send(errRespMsg.GetData(), errRespMsg.GetLength(), receiver, port);
-                    m_CallBack(false, *this, m_Peer);
+                    m_Callback(Status::failed, *this, m_Peer);
                 }
                 else if ((m_Session.IsControlling()) == (pRole->Type() == ATTR::Id::IceControlling))
                 {
@@ -452,8 +472,18 @@ namespace {
                     SubBindRespMsg respMsg(msg.TransationId(), xorMapAddr, m_Media.IcePwd());
                     respMsg.Finalize();
                     m_Carrier.Send(respMsg.GetData(), respMsg.GetLength(), receiver, port);
-                    m_SendCond.notify_one();
-                    m_CallBack(true, *this, m_Peer);
+
+                    const ATTR::UseCandidate *pUseCandidate(nullptr);
+                    if (msg.GetAttribute(pUseCandidate))
+                    {
+                        /*
+                         * invoke callback only when received use-candidate bind request
+                         */
+                        if (m_Session.IsControlling())
+                            m_Callback(Status::failed, *this, m_Peer);
+                        else
+                            m_Callback(Status::nominated, *this, m_Peer);
+                    }
                 }
             }
         }
@@ -486,8 +516,9 @@ namespace {
                 considered to have failed.
                 */
                 LOG_ERROR("CheckSession", "found unkonwn-attributs, set transaction as failed");
+                m_bWaitResp = false;
                 m_SendCond.notify_one();
-                m_CallBack(false, *this, m_Peer);
+                m_Callback(Status::failed, *this, m_Peer);
             }
             else if (msg.GetAttribute(pXorMapAddr) &&
                 pXorMapAddr->IP() == m_Peer.LCandidate().m_BaseIP &&
@@ -504,8 +535,9 @@ namespace {
                 symmetric.  If they are not symmetric, the agent sets the state of
                 the pair to Failed.
                 */
+                m_bWaitResp = false;
                 m_SendCond.notify_one();
-                m_CallBack(true, *this, m_Peer);
+                m_Callback(Status::passed, *this, m_Peer);
             }
             else
             {
@@ -515,8 +547,9 @@ namespace {
                         pXorMapAddr->IP().c_str(), pXorMapAddr->Port());
                 }
 
+                m_bWaitResp = false;
                 m_SendCond.notify_one();
-                m_CallBack(false, *this, m_Peer);
+                m_Callback(Status::failed, *this, m_Peer);
             }
         }
 
@@ -549,8 +582,9 @@ namespace {
                 there is no error code, invalid error resp message, set the status to failed
                 */
                 LOG_ERROR("CheckSession", "SubErrRespMsg has no error code");
+                m_bWaitResp = false;
                 m_SendCond.notify_one();
-                m_CallBack(false, *this, m_Peer);
+                m_Callback(Status::failed, *this, m_Peer);
             }
 
             auto errorCode = pErrCode->Code();
@@ -577,8 +611,9 @@ namespace {
                 additional information.
                 */
                 LOG_ERROR("CheckSession", "SubErrRespMsg,error code [%d]", errorCode);
+                m_bWaitResp = false;
                 m_SendCond.notify_one();
-                m_CallBack(false, *this, m_Peer);
+                m_Callback(Status::failed, *this, m_Peer);
             }
             else if (errorCode >= 500 && errorCode <= 599)
             {
@@ -591,18 +626,19 @@ namespace {
         }
 
     private:
-        STUN::TransId              m_Id;
-        DataCarrier               &m_Carrier;
-        STUN::SubBindReqMsg       *m_pMsg;
-        std::mutex                 m_pMsgMutex;
+        STUN::TransId m_Id;
+        DataCarrier &m_Carrier;
+        STUN::SubBindReqMsg *m_pMsg;
+        std::mutex m_pMsgMutex;
 
         std::thread m_SendThrd;
+        std::atomic_bool m_bWaitResp;
         std::condition_variable m_SendCond;
 
-        Callback      m_CallBack;
-
         ICE::Session &m_Session;
-        ICE::Media   &m_Media;
+        ICE::Media &m_Media;
+        Callback m_Callback;
+
         const TimeoutContainer &m_Timer;
         const ICE::CandidatePeer &m_Peer;
     };
@@ -617,6 +653,16 @@ namespace ICE {
 
     Stream::~Stream()
     {
+        m_Status = Status::quit;
+
+        if (m_KeepAliveThrd.joinable())
+            m_KeepAliveThrd.join();
+
+        m_ActiveChannel._channel->Close();
+
+        delete m_ActiveChannel._dataCarrier;
+        delete m_ActiveChannel._lcand;
+        delete m_ActiveChannel._channel;
     }
 
     bool Stream::GatherCandidates()
@@ -726,37 +772,31 @@ namespace ICE {
             return gatherSessions.size() == (failedSessions.size() + passedSessions.size());
         });
 
-        // release failed channel. "NOTICE" : have to realloc channel if protocol is not UDP
-        if (Protocol::udp != m_Protocol)
+        while (passedSessions.size())
         {
-            for (auto itor = passedSessions.begin(); itor != passedSessions.end(); ++itor)
+            auto itor = passedSessions.begin();
+            auto cand = itor->second.cand;
+            delete itor->first;
+
+            std::auto_ptr<Channel> channel(CreateChannel(m_Protocol, cand->m_BaseIP, cand->m_BasePort));
+            if (!channel.get() || !m_CandChannels.insert(std::make_pair(cand, channel.get())).second)
             {
-                auto cand = itor->second.cand;
+                LOG_ERROR("Stream", "GatherCandidate Create Candidate failed [%s:%d]",
+                    cand->m_BaseIP.c_str(), cand->m_BasePort);
 
-                assert(cand);
-
-                delete itor->first;
-
-                std::auto_ptr<Channel> channel(CreateChannel(m_Protocol, cand->m_BaseIP, cand->m_BasePort));
-                if (!channel.get() || !m_CandChannels.insert(std::make_pair(cand, channel.get())).second)
-                {
-                    LOG_ERROR("Stream", "GatherCandidate Create Candidate failed [%s:%d]",
-                        cand->m_BaseIP.c_str(), cand->m_BasePort);
-
-                    delete cand;
-                    continue;
-                }
-
-                channel.release();
+                delete cand;
+                continue;
             }
+
+            channel.release();
+
+            passedSessions.erase(itor);
         }
-        else
+
+        for (auto itor = failedSessions.begin(); itor != failedSessions.end(); ++itor)
         {
-            for (auto itor = failedSessions.begin(); itor != failedSessions.end(); ++itor)
-            {
-                delete itor->first;
-                assert(!itor->second.cand);
-            }
+            delete itor->first;
+            assert(!itor->second.cand);
         }
 
         // gather host cand
@@ -792,69 +832,50 @@ namespace ICE {
                 return *s1 < *s2;
             }
         };
+
         using DataCarrierMap = std::map<const Channel*, DataCarrier*>;
         using CheckSessions = std::set<CheckSession*, CheckSessCmp>;
 
-        struct Delegate{
-            void OnCheckSessionDone(bool bRet, CheckSession& session, const CandidatePeer& peer)
+        struct Delegate {
+            void OnCheckSessionDone(CheckSession::Status bRet, CheckSession& session, const CandidatePeer& peer)
             {
                 std::lock_guard<decltype(m_checkMutex)> locker(m_checkMutex);
-                auto & sessions = bRet ? m_PassedSessions : m_FailedSessions;
-                sessions.insert(&session);
 
-                if (bRet)
+                LOG_ERROR("Stream", "[%s:%d]=>[%s:%d] %s",
+                    peer.LCandidate().m_BaseIP.c_str(), peer.LCandidate().m_BasePort,
+                    peer.RCandidate().m_ConnIP.c_str(), peer.RCandidate().m_ConnPort,
+                    bRet == CheckSession::Status::failed ? "failed" : (bRet == CheckSession::Status::passed ? "passed" : "nominated"));
+
+                if (bRet == CheckSession::Status::failed || bRet == CheckSession::Status::passed)
                 {
-                    auto highest_session = *m_CheckSessions.begin();
-                    if (m_NominatingSessions.empty() && (highest_session == &session || *highest_session < session))
-                    {
-                        LOG_INFO("Stream", "CheckSession, send 'use-candidate' bind request");
-                        m_NominatingSessions.insert(&session);
-                        session.Start(true, std::bind(&Delegate::OnCheckSessionNominating, this,
-                            std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
-                    }
-                    else
-                        m_PassedSessions.insert(&session);
+                    auto & sessions = bRet == CheckSession::Status::failed ? m_FailedSessions : m_PassedSessions;
+                    sessions.insert(&session);
+                    if (m_CheckSessions.size() == (m_FailedSessions.size() + m_PassedSessions.size()))
+                        m_SessionCond.notify_one();
                 }
                 else
-                    m_FailedSessions.insert(&session);
-
-                m_CheckSessions.erase(&session);
-
-                if (m_CheckSessions.empty()
-                    && m_NominatingSessions.empty())
                 {
+                    m_pNominatingSession = &session;
                     m_SessionCond.notify_one();
                 }
             }
 
-            void OnCheckSessionNominating(bool bRet, CheckSession& session, const CandidatePeer& peer)
+            void OnCheckSessionNominating(CheckSession::Status bRet, CheckSession& session, const CandidatePeer& peer)
             {
                 std::lock_guard<decltype(m_checkMutex)> locker(m_checkMutex);
-                auto itor = m_NominatingSessions.find(&session);
-                assert(itor != m_NominatingSessions.end());
-                if (bRet)
-                {
-                    //cancel all session
-                    LOG_INFO("Stream", "Nominating has been done");
-                }
-                else if(m_CheckSessions.empty())
-                {
-                    m_FailedSessions.insert(&session);
-                    assert(m_CheckSessions.size() == (m_FailedSessions.size() + m_PassedSessions.size()));
-                    if (m_PassedSessions.empty())
-                    {
-                        LOG_ERROR("Stream", "Connectivity Check failed");
-                        m_SessionCond.notify_one();
-                        return;
-                    }
-                    else
-                    {
-                        auto n_session = *m_PassedSessions.begin();
-                        m_NominatingSessions.insert(n_session);
-                        n_session->Start(true, std::bind(&Delegate::OnCheckSessionNominating, this,
-                            std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
-                    }
-                }
+                assert(m_CheckSessions.find(&session) != m_CheckSessions.end());
+                assert(bRet != CheckSession::Status::nominated);
+
+                LOG_INFO("Stream", "[%s:%d] => [%s:%d] nominating %s",
+                    peer.LCandidate().m_BaseIP.c_str(), peer.LCandidate().m_BasePort,
+                    peer.RCandidate().m_ConnIP.c_str(), peer.RCandidate().m_ConnPort,
+                    bRet == CheckSession::Status::failed ? "Failed" : "Passed");
+
+                if (bRet == CheckSession::Status::failed)
+                    m_pNominatingSession = nullptr;
+                else
+                    m_pNominatingSession = &session;
+                m_SessionCond.notify_one();
             }
 
             std::mutex &m_checkMutex;
@@ -862,17 +883,18 @@ namespace ICE {
             CheckSessions &m_CheckSessions;
             CheckSessions &m_FailedSessions;
             CheckSessions &m_PassedSessions;
-            CheckSessions  m_NominatingSessions;
+            CheckSession *&m_pNominatingSession;
         };
 
         std::mutex  checkMutex;
         std::condition_variable checkCond;
         CheckSessions checkSessions, failedSessions, passedSessions;
+        CheckSession *pNominatedSession(nullptr);
 
         DataCarrierMap Carriers;
         for (auto peer_itor = CandPeers.begin(); peer_itor != CandPeers.end(); ++peer_itor)
         {
-            auto itor =  m_CandChannels.find(&peer_itor->LCandidate());
+            auto itor = m_CandChannels.find(&peer_itor->LCandidate());
             assert(itor != m_CandChannels.end() && itor->second);
 
             auto &rcand = peer_itor->RCandidate();
@@ -931,8 +953,6 @@ namespace ICE {
 
         if (Carriers.empty() || checkSessions.empty())
         {
-            m_Status = Status::gatheringdone;
-
             std::for_each(Carriers.begin(), Carriers.end(), [](auto &itor) {
                 delete itor.second;
             });
@@ -947,11 +967,17 @@ namespace ICE {
             return false;
         }
 
-        std::for_each(Carriers.begin(), Carriers.end(), [](auto &itor) {
+        std::for_each(Carriers.cbegin(), Carriers.cend(), [](auto &itor) {
             itor.second->Start();
         });
 
-        Delegate checkDelegate = { checkMutex, checkCond, checkSessions, failedSessions, passedSessions };
+        Delegate checkDelegate = {
+            checkMutex,
+            checkCond,
+            checkSessions,
+            failedSessions,
+            passedSessions,
+            pNominatedSession };
 
         for (auto itor = checkSessions.begin(); itor != checkSessions.end(); ++itor)
         {
@@ -959,18 +985,96 @@ namespace ICE {
             (*itor)->Start(false, std::bind(&Delegate::OnCheckSessionDone, &checkDelegate,
                 std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
         }
+
         // wait session check done
-        std::unique_lock<decltype(checkMutex)> locker(checkMutex);
-        checkCond.wait(locker, [&checkSessions]() {
-            return checkSessions.empty();
+        {
+            std::unique_lock<decltype(checkMutex)> locker(checkMutex);
+            checkCond.wait(locker, [this, &checkSessions, &passedSessions, &failedSessions, pNominatedSession]() {
+                return (checkSessions.size() == (passedSessions.size() + failedSessions.size())) || pNominatedSession;
+            });
+        }
+
+        if (m_Session.IsControlling())
+        {
+            assert(!pNominatedSession && checkSessions.size() == (passedSessions.size() + failedSessions.size()));
+
+            if (passedSessions.size())
+            {
+                auto session = *passedSessions.begin();
+                passedSessions.erase(session);
+
+                session->Start(true, std::bind(&Delegate::OnCheckSessionNominating, &checkDelegate,
+                    std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+
+                std::unique_lock<decltype(checkMutex)> locker(checkMutex);
+                checkCond.wait(locker);
+            }
+        }
+        else if (!pNominatedSession)
+        {
+            LOG_INFO("Stream", "Connectivity Check has been done, wait for nominating (%ds) ", sNominatingTimeout);
+            std::unique_lock<decltype(checkMutex)> locker(checkMutex);
+            checkCond.wait_for(locker, std::chrono::seconds(sNominatingTimeout));
+        }
+
+        LOG_INFO("Stream", "checkSessions [%d], passedSessions [%d], failedSessions[%d], nominatedSession [%p]",
+            checkSessions.size(), passedSessions.size(), failedSessions.size(), pNominatedSession);
+
+        if (pNominatedSession)
+        {
+            assert(checkSessions.find(pNominatedSession) != checkSessions.end());
+            checkSessions.erase(pNominatedSession);
+
+
+            auto peer = pNominatedSession->GetCandPeer();
+            auto cand_itor = m_CandChannels.find(&peer.LCandidate());
+
+            assert(cand_itor != m_CandChannels.end() && cand_itor->second);
+
+            LOG_INFO("Stream", "Actived Channel [%s:%d]=>[%s:%d]",
+                peer.LCandidate().m_BaseIP.c_str(), peer.LCandidate().m_BasePort,
+                peer.RCandidate().m_ConnIP.c_str(), peer.RCandidate().m_ConnPort);
+
+            m_ActiveChannel._lcand      = &peer.LCandidate();
+            m_ActiveChannel._rcand_ip   = peer.RCandidate().m_ConnIP;
+            m_ActiveChannel._rcand_port = peer.RCandidate().m_ConnPort;
+            m_ActiveChannel._channel    = cand_itor->second;
+
+            auto carrier_itor = Carriers.find(m_ActiveChannel._channel);
+            assert(carrier_itor != Carriers.end() && carrier_itor->second);
+
+            carrier_itor->second->Unregister();
+
+            m_ActiveChannel._dataCarrier = carrier_itor->second;
+            m_ActiveChannel._dataCarrier->Register(peer.RCandidate().m_ConnIP, peer.RCandidate().m_ConnPort,
+                std::bind(&Stream::OnDataReceived, this, std::placeholders::_1, std::placeholders::_2));
+
+            m_KeepAliveThrd = std::thread(KeepAliveThread, this);
+
+            // remove from container
+            Carriers.erase(carrier_itor);
+            m_CandChannels.erase(cand_itor);
+        }
+
+        std::for_each(m_CandChannels.begin(), m_CandChannels.end(), [](auto& itor) {
+            itor.second->Close();
         });
 
-        while (1);
         std::for_each(Carriers.begin(), Carriers.end(), [](auto &itor) {
             delete itor.second;
         });
 
-        return true;
+        std::for_each(checkSessions.begin(), checkSessions.end(), [](auto &itor) {
+            delete itor;
+        });
+
+        ReleaseCandidateChannel();
+
+        LOG_INFO("Stream", "Connectivity Check has been completed [%s]",
+            (pNominatedSession != nullptr ? "Succeeded" : "Failed"));
+
+        m_Status = Status::checkingdone;
+        return pNominatedSession != nullptr;
     }
 
     void Stream::GetCandidates(CandContainer & Cands) const
@@ -1020,12 +1124,42 @@ namespace ICE {
         }
     }
 
+    void Stream::KeepAliveThread(Stream * pThis)
+    {
+        assert(pThis);
+        assert(pThis->m_ActiveChannel._channel && pThis->m_ActiveChannel._dataCarrier);
+
+        uint16_t tr = Configuration::Instance().Tr();
+
+        while (pThis->m_Status != Status::quit)
+        {
+            STUN::TransId id;
+            STUN::MessagePacket::GenerateRFC5389TransationId(id);
+            STUN::IndicationMsg msg(id);
+            msg.Finalize();
+            pThis->m_ActiveChannel._dataCarrier->Send(msg.GetData(), msg.GetLength(),
+                pThis->m_ActiveChannel._rcand_ip, pThis->m_ActiveChannel._rcand_port);
+            std::this_thread::sleep_for(std::chrono::seconds(tr));
+        }
+    }
+
     void Stream::ReleaseCandidateChannel()
     {
         std::for_each(m_CandChannels.begin(), m_CandChannels.end(), [](auto &itor) {
             delete itor.first;
             delete itor.second;
         });
+    }
+
+    void Stream::OnDataReceived(const void * pData, uint32_t size)
+    {
+        if (!pData || size == 0)
+            return;
+
+        auto packet = reinterpret_cast<const STUN::PACKET::stun_packet*>(pData);
+        if (!STUN::MessagePacket::IsValidStunPacket(*packet, size))
+        {
+        }
     }
 
 }

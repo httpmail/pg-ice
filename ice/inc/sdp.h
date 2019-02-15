@@ -65,7 +65,8 @@ public:
 
 public:
     bool Decode(const std::string& offer);
-    bool Encode(const ICE::Session & session, std::string& offer);
+    bool EncodeOffer(const ICE::Session & session, std::string& offer);
+    bool EncodeAnswer(const ICE::Session &session, const std::string &offer, std::string& answer);
     const RemoteMediaContainer& GetRemoteMedia() const { return m_RemoteMedias; }
 
 private:

@@ -17,6 +17,7 @@ public:
     uint16_t Rm()  const { return m_Rm; }
     uint16_t Ti()  const { return m_Ti; }
     uint16_t Rc()  const { return m_Rc; }
+    uint16_t Tr()  const { return m_Tr; }
     uint16_t CandPairsLimits() const { return m_cand_pairs_limits; }
     bool     IPv4Supported()   const { return m_ipv4_supported; }
 
@@ -41,6 +42,7 @@ private:
 
 private:
     uint32_t m_LocalPref;
+    uint16_t m_Tr;  /* used for send keep alive */
     uint16_t m_RTO; /* initial value recommended 500ms - 3s */
     uint16_t m_Ta;  /* default value 50ms */
     uint16_t m_Rm;  /* default value 16   */
@@ -64,5 +66,5 @@ private:
     static const uint16_t sIPv4Supported = 1;
     static const uint16_t sLowerPort = 30000;
     static const uint16_t sUpperPort = 32000;
-
+    static const uint16_t sDefaultTr = 20; //seconds
 };

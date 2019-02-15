@@ -153,7 +153,7 @@ namespace STUN {
     public:
         FirstBindReqMsg(const TransId& transId) : MessagePacket(MsgType::BindingRequest, transId) {}
         FirstBindReqMsg(const PACKET::stun_packet& packet, uint16_t packet_size);
-        virtual void Finalize() {}
+        virtual void Finalize() override;
     };
 
     class FirstBindRespMsg : public MessagePacket {
@@ -197,6 +197,16 @@ namespace STUN {
         SubBindErrRespMsg(TransIdConstRef id, uint8_t classCode, uint8_t number, const std::string& reason);
         SubBindErrRespMsg(TransIdConstRef id, const UnkonwnAttrContainer unknownAttr);
         SubBindErrRespMsg(const PACKET::stun_packet& packet, uint16_t packet_size);
+        virtual void Finalize() override;
+    };
+
+    class IndicationMsg : public MessagePacket {
+    public:
+        IndicationMsg(TransIdConstRef id) :
+            MessagePacket(MsgType::BindingIndicate,id)
+        {
+        }
+
         virtual void Finalize() override;
     };
 }

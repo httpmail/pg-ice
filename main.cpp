@@ -35,7 +35,7 @@ int main()
 {
     auto& config = Configuration::Instance();
 
-    //config.AddStunServer("64.235.150.11",3478);
+    config.AddStunServer("64.235.150.11",3478);
     //config.AddStunServer("216.93.246.18", 3478);
     //config.AddStunServer("192.168.110.123", 3478);
 
@@ -59,7 +59,7 @@ int main()
     };
 
     std::string offer;
-    session.SetControlling(true);
+    session.SetControlling(false);
     if (session.CreateMedia(videoMedia))
     {
 
@@ -98,8 +98,9 @@ int main()
             LOG_ERROR("Exception", ":%s", e.what());
         }
 
-        session.ConnectivityCheck(sOffer);
-
+        std::string answerOffer;
+        session.MakeAnswer(sOffer, answerOffer);
+        LOG_ERROR("answer", "%s", answerOffer.c_str());
     }
     else
     {
