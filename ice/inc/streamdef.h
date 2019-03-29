@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <vector>
 #include <string>
+#include <functional>
 
 namespace ICE {
 
@@ -16,13 +17,16 @@ namespace ICE {
     };
 
     struct MediaAttr{
+        using OnRxCallBack = std::function<void(const void *pData, uint32_t size)>;
         struct StreamAttr {
             Protocol    m_Protocol;
             uint8_t     m_CompId;
             uint16_t    m_HostPort;
             std::string m_HostIP;
+            OnRxCallBack m_RxCB;
         };
         std::string             m_Name;
+        bool                    m_Multiplexed;
         std::vector<StreamAttr> m_StreamAttrs;
     };
 }

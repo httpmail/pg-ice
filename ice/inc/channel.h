@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <string>
 #include <boost/asio.hpp>
+#include <mutex>
 #include <type_traits>
 
 #include "pg_log.h"
@@ -33,7 +34,7 @@ namespace ICE{
         Channel() {};
         virtual ~Channel() = 0 {}
 
-        virtual bool Bind(const std::string& ip, uint16_t port) noexcept = 0;
+        virtual bool Bind(const std::string& ip, uint16_t port, bool bReuse = true) noexcept = 0;
 
         virtual int32_t Recv(void *buffer, int32_t size, bool framing = false) noexcept = 0;
         virtual int32_t Recv(void *buffer, int32_t size, std::string &sender_ip, uint16_t &sender_port, bool framing = false) noexcept = 0;
@@ -58,11 +59,11 @@ namespace ICE{
         static bool Shutdown(T &s, ShutdownOption op) noexcept;
 
         template<class T>
-        static bool Bind(T &s, typename const channel_type<std::is_base_of<boost::asio::ip::udp::socket, T>::value>::endpoint &ep);
+        static bool Bind(T &s, typename const channel_type<std::is_base_of<boost::asio::ip::udp::socket, T>::value>::endpoint &ep, bool bReuse);
 
     protected:
         static boost::asio::io_service sIOService;
-        static const char* sInvalidIP;
+        static const char*             sInvalidIP;
     };
 
     class UDPChannel : public Channel {
@@ -74,7 +75,7 @@ namespace ICE{
         virtual ~UDPChannel();
 
     public:
-        virtual bool Bind(const std::string& ip, uint16_t port) noexcept override;
+        virtual bool Bind(const std::string& ip, uint16_t port, bool bReuse = false) noexcept override;
 
         virtual int32_t Recv(void *buffer, int32_t size, bool framing) noexcept override;
         virtual int32_t Recv(void *buffer, int32_t size, std::string &sender_ip, uint16_t &sender_port, bool framing) noexcept override;
@@ -106,7 +107,7 @@ namespace ICE{
         virtual ~TCPChannel();
 
     public:
-        virtual bool Bind(const std::string& ip, uint16_t port) noexcept override;
+        virtual bool Bind(const std::string& ip, uint16_t port, bool bReuse = false) noexcept override;
 
         virtual int32_t Recv(void *buffer, int32_t size, bool framing) noexcept override;
         virtual int32_t Recv(void *buffer, int32_t size, std::string &sender_ip, uint16_t &sender_port, bool framing) noexcept override;
@@ -139,7 +140,7 @@ namespace ICE{
         ~TCPPassiveChannel() {}
 
     public:
-        virtual bool Bind(const std::string& ip, uint16_t port) noexcept override;
+        virtual bool Bind(const std::string& ip, uint16_t port, bool bReuse = false) noexcept override;
         virtual bool Connect(const std::string& ip, uint16_t port) noexcept override;
 
         virtual bool Shutdown(ShutdownOption op) noexcept override;
@@ -191,7 +192,7 @@ namespace ICE{
     }
 
     template<class T>
-    inline bool Channel::Bind(T & s, typename const channel_type<std::is_base_of<boost::asio::ip::udp::socket, T>::value>::endpoint& ep)
+    inline bool Channel::Bind(T & s, typename const channel_type<std::is_base_of<boost::asio::ip::udp::socket, T>::value>::endpoint& ep, bool bReuse)
     {
         using namespace boost::asio::ip;
 
@@ -201,15 +202,19 @@ namespace ICE{
 
         boost::system::error_code error;
 
-        s.open(ep.protocol(), error);
-        if (error.value())
+        if (s.open(ep.protocol(), error).value())
         {
             LOG_ERROR("Channel", "open error : [%d]", error.value());
             return false;
         }
 
-        s.bind(ep, error);
-        if (error.value())
+        if (bReuse && s.set_option(boost::asio::socket_base::reuse_address(true), error).value())
+        {
+            LOG_ERROR("Channel", "reuse error : [%d]", error.value());
+            return false;
+        }
+
+        if (s.bind(ep, error).value())
         {
             LOG_ERROR("Channel", "Bind error : [%d]", error.value());
             return false;

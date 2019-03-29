@@ -1,16 +1,15 @@
 #pragma once
 
 #include <stdint.h>
-
 #include <unordered_set>
 #include <unordered_map>
 #include <string>
 
+#include "candidate.h"
+
 namespace ICE {
     class Session;
-    class Candidate;
 }
-
 class CSDP {
 public:
     class RemoteMedia {
@@ -29,17 +28,17 @@ public:
         const std::string& Type() const { return m_type; }
         const ComponentCands& Candidates() const { return m_Cands; }
 
-        bool AddHostCandidate(uint8_t compId, uint32_t pri, const std::string& foundation, const std::string& connIP, uint16_t connPort);
+        bool AddHostCandidate(ICE::Protocol protocol,uint8_t compId, uint32_t pri, const std::string& foundation, const std::string& connIP, uint16_t connPort);
 
-        bool AddSrflxCandidate(uint8_t compId, uint32_t pri, const std::string& foundation,
+        bool AddSrflxCandidate(ICE::Protocol protocol, uint8_t compId, uint32_t pri, const std::string& foundation,
             const std::string& connIP, uint16_t connPort,
             const std::string& baseIP, uint16_t basePort);
 
-        bool AddPrflxCandidate(uint8_t compId, uint32_t pri, const std::string& foundation,
+        bool AddPrflxCandidate(ICE::Protocol protocol, uint8_t compId, uint32_t pri, const std::string& foundation,
             const std::string& connIP, uint16_t connPort,
             const std::string& baseIP, uint16_t basePort);
 
-        bool AddRelayCandidate(uint8_t compId, uint32_t pri, const std::string& foundation,
+        bool AddRelayCandidate(ICE::Protocol protocol, uint8_t compId, uint32_t pri, const std::string& foundation,
             const std::string& connIP, uint16_t connPort,
             const std::string& baseIP, uint16_t basePort);
 

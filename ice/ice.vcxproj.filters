@@ -53,6 +53,9 @@
     <ClCompile Include="src\DataCarrier.cpp">
       <Filter>ice</Filter>
     </ClCompile>
+    <ClCompile Include="src\natdetect.cpp">
+      <Filter>ice</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="inc\agent.h">

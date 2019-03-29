@@ -116,6 +116,9 @@ namespace STUN {
             Fingerprint = 0x8028,
             IceControlled = 0x8029, /* RFC8445 16.1 */
             IceControlling = 0x802A, /* RFC8445 16.1 */
+
+            MsCandInd = 0x8054,
+            MsIce2 = 0x8070,
         };
 
         ////////////////////// attribute ////////////////////////////////
@@ -219,18 +222,17 @@ namespace STUN {
          */
         class ChangeRequest : public Header {
         public:
-            ChangeRequest(bool changeIP) :
+            ChangeRequest(bool changeIP, bool changePort) :
+                placeholder_1(0), placeholder_2(0), m_ChangeIP(changeIP),m_ChangePort(changePort),
                 Header(Id::ChangeRequest, 4)
-            {}
+            {
+            }
 
         private:
-            unsigned : 16;
-            unsigned : 8;
-            unsigned : 1;
-            unsigned m_ChangeIP     :1;
-            unsigned m_ChangePort   :1;
-            unsigned : 1;
-            unsigned : 4;
+            unsigned placeholder_1 :25;
+            unsigned m_ChangePort : 1;
+            unsigned m_ChangeIP    :1;
+            unsigned placeholder_2 :5;
         };
 
         class SourceAddress : public MappedAddress {
@@ -343,8 +345,6 @@ namespace STUN {
             {
                 auto len = static_cast<uint16_t>(reason.length());
                 assert(len < sTextLimite);
-
-                ContentLength(len + 4);
                 memcpy(m_Reason, reason.data(), len);
             }
 

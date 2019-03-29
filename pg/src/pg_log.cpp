@@ -5,6 +5,9 @@
 #include <iostream>
 #include <boost/filesystem.hpp>
 #include "pg_buffer.h"
+#include "atlbase.h"
+#include "atlstr.h"
+#include <Windows.h>
 
 namespace PG {
     log::log() :
@@ -14,19 +17,20 @@ namespace PG {
 
     log::~log()
     {
-        std::unique_lock<decltype(m_LogMutex)> locker(m_LogMutex);
-        m_LogCond.wait(locker, [this] {
-            return this->m_Logs.empty();
-        });
-
         m_bQuit = true;
         m_LogCond.notify_one();
 
+        if (m_WriteThrd.joinable())
+            m_WriteThrd.join();
+
         if (m_FileStream.is_open())
         {
-            m_FileStream.close();
-            m_FileStream.flush();
+           m_FileStream.close();
+           m_FileStream.flush();
         }
+
+        std::lock_guard<decltype(m_LogMutex)> locker(m_LogMutex);
+        m_Logs.clear();
     }
 
     log & log::Instance()
@@ -40,7 +44,7 @@ namespace PG {
         if (m_FileStream.is_open())
             return true;
 
-        m_FileStream.open(file_path, std::ios::app);
+        m_FileStream.open(file_path, std::ios::trunc | std::ios::out);
         return m_FileStream.is_open();
     }
 
@@ -49,7 +53,6 @@ namespace PG {
         assert(file_path && pFormat && levelInfo);
         try
         {
-#if 1
             thread_local std::shared_ptr<TLSContainer> Buffer(new TLSContainer);
 
             auto& buffer = Buffer->Lock4Write();
@@ -57,7 +60,16 @@ namespace PG {
             boost::filesystem::path full_path(file_path, boost::filesystem::native);
             assert(boost::filesystem::is_regular_file(full_path) && boost::filesystem::exists(full_path));
 
-            auto head_len = sprintf_s(buffer.data(), Buffer->DataLength(), "[%s]: %s(%d) : ",levelInfo, full_path.filename().string().c_str(), line);
+            std::string filename(file_path);
+
+            auto pos = filename.rfind("\\");
+            if (pos == std::string::npos)
+                pos = filename.rfind("/");
+
+            if (pos != std::string::npos)
+                filename = filename.substr(pos + 1);
+
+            auto head_len = sprintf_s(buffer.data(), Buffer->DataLength(), "[%s]: %s(%d) : ",levelInfo, filename.c_str(), line);
             assert(head_len < Buffer->DataLength());
 
             auto remain_buffer_bytes = Buffer->DataLength() - head_len;
@@ -70,23 +82,13 @@ namespace PG {
             Buffer->Unlock(buffer);
 
             std::lock_guard<decltype(m_LogMutex)> locker(m_LogMutex);
+            if (m_bQuit)
+                return;
+
             m_Logs.push_back(Buffer);
             va_end(argp);
 
             m_LogCond.notify_one();
-#else
-            static char buf[4096 + 4096];
-            std::lock_guard<decltype(m_LogMutex)> locker(m_LogMutex);
-            boost::filesystem::path full_path(file_path, boost::filesystem::native);
-            auto head_len = sprintf_s(buf, sizeof(buf), "[%s]: %s(%d) : ", levelInfo, full_path.filename().string().c_str(), line);
-            auto remain_buffer_bytes = sizeof(buf) - head_len;
-            va_list argp;
-
-            va_start(argp, pFormat);
-            auto real_bytes = vsnprintf(&buf[head_len], remain_buffer_bytes, pFormat, argp);
-            va_end(argp);
-            std::cout << buf << std::endl;
-#endif
         }
         catch (const std::exception &)
         {

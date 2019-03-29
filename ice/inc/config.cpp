@@ -24,7 +24,7 @@ namespace {
             Addresses from a loopback interface MUST NOT be included in the
             candidate addresses
             */
-            if (ep_address.is_loopback())
+            if (ep_address.is_loopback() || ep_address.is_v6())
                 continue;
 
             if (ep_address.is_v6())

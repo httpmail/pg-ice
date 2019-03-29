@@ -7,10 +7,15 @@ namespace ICE {
     class Channel;
 
     class DataCarrier {
-    private:
-        using RecvCallBack = std::function<void(const void*, uint32_t)>;
+    public:
+        enum class send_status {
+            timeout,
+            ok,
+            failed
+        };
 
-    private:
+    protected:
+        using RecvCallBack = std::function<void(const void*, int32_t)>;
         struct TransportAddress
         {
             bool operator < (const TransportAddress& other) const
@@ -38,18 +43,33 @@ namespace ICE {
             uint32_t                  m_size;
         };
 
+        enum class Status {
+            init,
+            starting,
+            started,
+            quit,
+        };
+
     public:
         DataCarrier(ICE::Channel &channel);
         virtual ~DataCarrier();
 
-        void Start();
-        bool Send(const void *data, uint32_t size, const std::string &dest, uint16_t port);
-        bool Register(const std::string& target, uint16_t port, RecvCallBack recvCallback);
+        virtual void Start();
+        virtual bool Register(const std::string& target, uint16_t port, RecvCallBack recvCallback);
+
+    public:
+        void Stop();
+        send_status Send(const void *data, uint32_t size, const std::string &dest, uint16_t port, uint32_t msecTimeout = 500);
         bool Unregister(const std::string& target, uint16_t port);
         void Unregister();
 
-    private:
-        bool IsQuit() const;
+    protected:
+        bool StartThread();
+        void SetStatus(Status eStatus);
+        bool IsStatus(Status eStatus);
+
+    public:
+        static void Dealloc(const void *data);
 
     private:
         static bool Initilize();
@@ -59,7 +79,7 @@ namespace ICE {
 
     private:
         static Packet* AllocPacket();
-        static void Dealloc(Packet* packet);
+        static void Dealloc(Packet *packet);
 
     private:
         static const uint16_t sPacketCacheSize = 256;
@@ -87,11 +107,29 @@ namespace ICE {
         mutable std::mutex      m_RecvMutex;
         std::condition_variable m_RecvCond;
 
-        std::atomic_bool        m_bQuit;
-        std::mutex              m_StartedMutex;
-        bool                    m_bStarted;
+        std::condition_variable m_StatusCond;
+        std::mutex              m_StatusMutex;
+        Status                  m_Status;
 
         std::mutex     m_ListenerMutex;
         RecvListener   m_RecvListener;
+    };
+
+    class ConnectedDataCarrier : public DataCarrier {
+    public:
+        ConnectedDataCarrier(ICE::Channel &channel, const std::string& dest, uint16_t port);
+        virtual ~ConnectedDataCarrier();
+
+    public:
+        virtual void Start() override;
+        virtual bool Register(const std::string& target, uint16_t port, RecvCallBack recvCallback);
+
+    private:
+        static void ConnectThread(ConnectedDataCarrier *pThis);
+
+    private:
+        std::thread m_ConnectedThrd;
+        const std::string m_dest;
+        const uint16_t    m_port;
     };
 }

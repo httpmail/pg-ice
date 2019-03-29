@@ -40,6 +40,7 @@ namespace SDPDEF {
     static const std::string UDP = "UDP";
     static const std::string TCP_ACT = "tcp-act";
     static const std::string TCP_PASS = "tcp-pass";
+    static const std::string transport_protocol = "RTP/SAVP";
 
     static const uint16_t min_cand_content_num = 8;
     static const uint16_t nonhost_cand_content_num = 12;
@@ -120,6 +121,16 @@ namespace SDPDEF {
             return UDP.c_str();
     }
 
+    ICE::Protocol ProtocolName2Value(const std::string name)
+    {
+        if (0 == _strcmpi(name.c_str(), TCP_PASS.c_str()))
+            return ICE::Protocol::tcp_pass;
+        else if (0 == _strcmpi(name.c_str(), TCP_ACT.c_str()))
+            return ICE::Protocol::tcp_act;
+        else
+            return ICE::Protocol::udp;
+    }
+
     bool IsValidAttrPos(std::string::size_type pos)
     {
         return pos != std::string::npos;
@@ -158,6 +169,8 @@ CSDP::CSDP()
 
 CSDP::~CSDP()
 {
+    for (auto itor = m_RemoteMedias.begin(); itor != m_RemoteMedias.end(); ++itor)
+        delete itor->second;
 }
 
 /*
@@ -237,10 +250,11 @@ bool CSDP::Decode(const std::string & offer)
 bool CSDP::EncodeOffer(const ICE::Session & session, std::string& offer)
 {
     auto Medias = session.GetMedias();
+
     assert(Medias.size());
 
-    bool isIPv4 = boost::asio::ip::address::from_string(session.DefaultIP()).is_v4();
 
+    bool isIPv4 = boost::asio::ip::address::from_string(session.DefaultIP()).is_v4();
     std::ostringstream offer_stream;
 
     // encode "v" line
@@ -275,20 +289,18 @@ bool CSDP::EncodeOffer(const ICE::Session & session, std::string& offer)
     //encode "a=candidate"
     for (auto media_itor = Medias.begin(); media_itor != Medias.end(); ++media_itor)
     {
-        auto *rtp = media_itor->second->GetStreamById(static_cast<uint16_t>(ICE::Media::ClassicID::RTP));
-
+        auto rtp_default_port = media_itor->second->GetDefaultPort(static_cast<uint16_t>(ICE::Media::ClassicID::RTP));
         // encode "m" line
         offer_stream << SDPDEF::m_line
             << media_itor->first << " "
-            << rtp->GetDefaultPort() << " "
-            << rtp->GetTransportProtocol() << " "
+            << rtp_default_port << " "
+            << SDPDEF::transport_protocol << " "
             << 0 << SDPDEF::CRLF;
 
         // encode "rtcp" line
-        auto *rtcp = media_itor->second->GetStreamById(static_cast<uint16_t>(ICE::Media::ClassicID::RTCP));
-        assert(rtcp);
+        auto rtcp_default_port = media_itor->second->GetDefaultPort(static_cast<uint16_t>(ICE::Media::ClassicID::RTCP));
         offer_stream << SDPDEF::rtcp_line
-            << rtcp->GetDefaultPort() << SDPDEF::CRLF;
+                     << rtcp_default_port << SDPDEF::CRLF;
 
         // encode "a=ice-pwd"
         offer_stream << SDPDEF::icepwd_line
@@ -298,15 +310,18 @@ bool CSDP::EncodeOffer(const ICE::Session & session, std::string& offer)
         offer_stream << SDPDEF::iceufrag_line
             << media_itor->second->IceUfrag() << SDPDEF::CRLF;
 
-        auto Streams = media_itor->second->GetStreams();
+        auto & Streams = media_itor->second->GetStreams();
         assert(Streams.size());
-        for (auto stream_itor = Streams.begin(); stream_itor != Streams.end(); ++stream_itor)
+        for (auto streams_itor = Streams.begin(); streams_itor != Streams.end(); ++streams_itor)
         {
-            ICE::CandContainer cands;
-            stream_itor->second->GetCandidates(cands);
-            auto compId = stream_itor->first;
+            assert(streams_itor->second);
+            auto stream = streams_itor->second;
 
-            const char* transport = SDPDEF::GetProtocolName(stream_itor->second->GetProtocol());
+            ICE::CandContainer cands;
+            stream->GetCandidates(cands);
+            auto compId = stream->ComponentId();
+
+            const char* transport = SDPDEF::GetProtocolName(stream->GetProtocol());
             for (auto& cand_itor = cands.begin(); cand_itor != cands.end(); ++cand_itor)
             {
                 auto cand = *cand_itor;
@@ -337,9 +352,11 @@ bool CSDP::EncodeOffer(const ICE::Session & session, std::string& offer)
         }
     }
 
-
     offer = offer_stream.str();
-    return offer.length() > 0;
+    if (offer.length() == 0)
+        return false;
+
+    return true;
 }
 
 bool CSDP::EncodeAnswer(const ICE::Session & session, const std::string & offer, std::string & answer)
@@ -355,7 +372,10 @@ bool CSDP::EncodeAnswer(const ICE::Session & session, const std::string & offer,
 
         remote_line << SDPDEF::remotecand_line;
 
-        for (auto stream_itor = media->GetStreams().begin(); stream_itor != media->GetStreams().end(); ++stream_itor)
+        auto valid_streams = media->GetValidStreams();
+        assert(valid_streams.size());
+
+        for (auto stream_itor = valid_streams.begin(); stream_itor != valid_streams.end(); ++stream_itor)
         {
             assert(stream_itor->second);
             auto stream = stream_itor->second;
@@ -368,15 +388,21 @@ bool CSDP::EncodeAnswer(const ICE::Session & session, const std::string & offer,
         }
 
         std::string remote = remote_line.str();
-        // trim space from the end
-        remote.pop_back();
+        auto pos = remote.rfind(SDPDEF::CRLF);
+        if (pos != std::string::npos)
+        {
+            remote.erase(pos, SDPDEF::CRLF.length());
+        }
 
-        auto pos = offer.find(media_itor->first);
+        pos = offer.find(media_itor->first);
         assert(pos != std::string::npos);
 
         auto nxt_media = offer.find(SDPDEF::m_line, pos);
         if (std::string::npos == nxt_media)
+        {
+            answer += SDPDEF::CRLF;
             answer.append(remote);
+        }
         else
         {
             remote += SDPDEF::CRLF;
@@ -520,7 +546,7 @@ CSDP::RemoteMedia* CSDP::DecodeMediaLine(const std::string & mediaLine, bool bSe
             return nullptr;
         }
 
-        cand_content[static_cast<uint16_t>(SDPDEF::CandAttrIndex::transport)];
+        auto protocol = SDPDEF::ProtocolName2Value(cand_content[static_cast<uint16_t>(SDPDEF::CandAttrIndex::transport)]);
 
         uint32_t compId, priority;
         uint16_t conn_port(0), conn_rport(0);
@@ -540,7 +566,7 @@ CSDP::RemoteMedia* CSDP::DecodeMediaLine(const std::string & mediaLine, bool bSe
 
         if (candtype == SDPDEF::host_cand_type)
         {
-            if (!remoteMedia->AddHostCandidate(compId, priority,
+            if (!remoteMedia->AddHostCandidate(protocol, compId, priority,
                 cand_content[static_cast<uint8_t>(SDPDEF::CandAttrIndex::foundation)],
                 cand_content[static_cast<uint8_t>(SDPDEF::CandAttrIndex::conn_addr)],
                 conn_port))
@@ -551,7 +577,7 @@ CSDP::RemoteMedia* CSDP::DecodeMediaLine(const std::string & mediaLine, bool bSe
         }
         else if (candtype == SDPDEF::srflx_cand_type)
         {
-            if (!remoteMedia->AddSrflxCandidate(compId, priority,
+            if (!remoteMedia->AddSrflxCandidate(protocol,compId, priority,
                 cand_content[static_cast<uint8_t>(SDPDEF::CandAttrIndex::foundation)],
                 cand_content[static_cast<uint8_t>(SDPDEF::CandAttrIndex::conn_addr)],conn_port,
                 cand_content[static_cast<uint8_t>(SDPDEF::CandAttrIndex::conn_raddr)], conn_rport))
@@ -562,7 +588,7 @@ CSDP::RemoteMedia* CSDP::DecodeMediaLine(const std::string & mediaLine, bool bSe
         }
         else if (candtype == SDPDEF::relay_cand_type)
         {
-            if (!remoteMedia->AddRelayCandidate(compId, priority,
+            if (!remoteMedia->AddRelayCandidate(protocol, compId, priority,
                 cand_content[static_cast<uint8_t>(SDPDEF::CandAttrIndex::foundation)],
                 cand_content[static_cast<uint8_t>(SDPDEF::CandAttrIndex::conn_addr)], conn_port,
                 cand_content[static_cast<uint8_t>(SDPDEF::CandAttrIndex::conn_raddr)], conn_rport))
@@ -728,10 +754,27 @@ CSDP::RemoteMedia::~RemoteMedia()
     }
 }
 
-bool CSDP::RemoteMedia::AddHostCandidate(uint8_t compId, uint32_t pri, const std::string& foundation, const std::string & baseIP, uint16_t basePort)
+bool CSDP::RemoteMedia::AddHostCandidate(ICE::Protocol protocol, uint8_t compId, uint32_t pri, const std::string& foundation, const std::string & baseIP, uint16_t basePort)
 {
-    std::auto_ptr<ICE::HostCand> cand(new ICE::HostCand(pri, foundation, baseIP, basePort));
+    std::auto_ptr<ICE::Candidate> cand(nullptr);
+    switch (protocol)
+    {
+    case ICE::Protocol::tcp_act:
+        cand.reset(new ICE::ActiveCand(pri,foundation,baseIP,basePort));
+        break;
 
+    case ICE::Protocol::tcp_pass:
+        cand.reset(new ICE::PassiveCand(pri,foundation,baseIP,basePort));
+        break;
+
+    case ICE::Protocol::udp:
+        cand.reset(new ICE::HostCand(pri, foundation, baseIP, basePort));
+        break;
+
+    default:
+        assert(0);
+        break;
+    }
     if (cand.get() && AddCandidate(compId, cand.get()))
     {
         cand.release();
@@ -740,11 +783,29 @@ bool CSDP::RemoteMedia::AddHostCandidate(uint8_t compId, uint32_t pri, const std
     return false;
 }
 
-bool CSDP::RemoteMedia::AddSrflxCandidate(uint8_t compId, uint32_t pri, const std::string& foundation,
+bool CSDP::RemoteMedia::AddSrflxCandidate(ICE::Protocol protocol, uint8_t compId, uint32_t pri, const std::string& foundation,
     const std::string& connIP, uint16_t connPort,
     const std::string& baseIP, uint16_t basePort)
 {
-    std::auto_ptr<ICE::SvrCand> cand(new ICE::SvrCand(pri, foundation, connIP, connPort, baseIP, basePort));
+    std::auto_ptr<ICE::Candidate> cand(nullptr);
+    switch (protocol)
+    {
+    case ICE::Protocol::tcp_act:
+        cand.reset(new ICE::SvrActiveCand(pri, foundation, connIP, connPort, baseIP, basePort));
+        break;
+
+    case ICE::Protocol::tcp_pass:
+        cand.reset(new ICE::SvrPassiveCand(pri, foundation, connIP, connPort, baseIP, basePort));
+        break;
+
+    case ICE::Protocol::udp:
+        cand.reset(new ICE::SvrCand(pri, foundation, connIP, connPort, baseIP, basePort));
+        break;
+
+    default:
+        assert(0);
+        break;
+    }
 
     if (cand.get() && AddCandidate(compId, cand.get()))
     {
@@ -754,7 +815,7 @@ bool CSDP::RemoteMedia::AddSrflxCandidate(uint8_t compId, uint32_t pri, const st
     return false;
 }
 
-bool CSDP::RemoteMedia::AddPrflxCandidate(uint8_t compId, uint32_t pri, const std::string& foundation,
+bool CSDP::RemoteMedia::AddPrflxCandidate(ICE::Protocol protocol, uint8_t compId, uint32_t pri, const std::string& foundation,
     const std::string& connIP, uint16_t connPort,
     const std::string& baseIP, uint16_t basePort)
 {
@@ -769,7 +830,7 @@ bool CSDP::RemoteMedia::AddPrflxCandidate(uint8_t compId, uint32_t pri, const st
     return false;
 }
 
-bool CSDP::RemoteMedia::AddRelayCandidate(uint8_t compId, uint32_t pri, const std::string& foundation, const std::string & connIP, uint16_t connPort, const std::string & baseIP, uint16_t basePort)
+bool CSDP::RemoteMedia::AddRelayCandidate(ICE::Protocol protocol, uint8_t compId, uint32_t pri, const std::string& foundation, const std::string & connIP, uint16_t connPort, const std::string & baseIP, uint16_t basePort)
 {
     std::auto_ptr<ICE::RelayedCand> cand(new ICE::RelayedCand(pri, foundation, connIP, connPort, baseIP, basePort));
 

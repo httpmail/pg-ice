@@ -80,7 +80,7 @@ namespace STUN {
         int32_t SendData(ICE::Channel& channel, const std::string& dest, uint16_t port);
 
         const ATTR::MappedAddress*    GetAttribute(const ATTR::MappedAddress*& mapAddr) const;
-        const ATTR::XorMappAddress*    GetAttribute(const ATTR::XorMappAddress *& mapAddr) const;
+        const ATTR::XorMappAddress*   GetAttribute(const ATTR::XorMappAddress *& mapAddr) const;
         const ATTR::ChangeRequest*    GetAttribute(const ATTR::ChangeRequest*& changeReq) const;
         const ATTR::XorMappedAddrSvr* GetAttribute(const ATTR::XorMappedAddrSvr*& xorMap) const;
         const ATTR::Role*             GetAttribute(const ATTR::Role*& role) const;
@@ -95,6 +95,7 @@ namespace STUN {
         const ATTR::Fingerprint*      GetAttribute(const ATTR::Fingerprint*& figerprint) const;
         const ATTR::UnknownAttributes* GetAttribute(const ATTR::UnknownAttributes*& unknowAttrs) const;
         const ATTR::ErrorCode*        GetAttribute(const ATTR::ErrorCode*& errCode) const;
+        const ATTR::ChangedAddress*   GetAttribute(const ATTR::ChangedAddress*& changedAddr) const;
 
         const UnkonwnAttrContainer& GetUnkonwnAttrs() const { return m_UnkonwnAttrs; }
 

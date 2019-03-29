@@ -6,6 +6,7 @@
 #include <map>
 #include <thread>
 #include <mutex>
+#include <atomic>
 #include <assert.h>
 
 namespace ICE {
@@ -15,31 +16,7 @@ namespace ICE {
 
     class Session {
     public:
-        struct StreamInfo {
-        public:
-            StreamInfo(Stream* stream, const std::string & lpwd, const std::string & rpwd, const std::string& lufrag, const std::string& rufrag) :
-                m_pStream(stream), m_LPwd(lpwd), m_RPwd(rpwd), m_LUfrag(lufrag), m_RUfrag(rufrag)
-            {
-                assert(stream);
-            }
-            bool operator< (const StreamInfo &other) const
-            {
-                if (m_pStream == other.m_pStream)
-                    return false;
-                return m_pStream < other.m_pStream;
-            }
-
-        public:
-            Stream              *m_pStream;
-            const std::string   &m_LPwd;
-            const std::string   &m_RPwd;
-            const std::string   &m_LUfrag;
-            const std::string   &m_RUfrag;
-        };
-
-    public:
         using MediaContainer    = std::map<std::string, Media*>;
-        using CheckContainer    = std::map<StreamInfo, CandPeerContainer*>; /*key[@uint16_t component id]*/
 
     public:
         explicit Session(const std::string& sessionName = "-", const std::string& userName = "-");
@@ -48,9 +25,8 @@ namespace ICE {
         void SetControlling(bool bControlling = true);
         bool IsControlling() const;
         bool CreateMedia(const MediaAttr& mediaAttr);
-        bool ConnectivityCheck(const std::string& offer);
-        bool MakeOffer(std::string& offer);
-        bool MakeAnswer(const std::string& remoteOffer, std::string& answer);
+        const std::string& MakeOffer();
+        const std::string& MakeAnswer(const std::string& remoteOffer);
 
         const MediaContainer& GetMedias() const { return m_Medias; }
 
@@ -58,18 +34,30 @@ namespace ICE {
         const std::string& DefaultIP() const  { return m_DefaultIP; }
         const std::string& SessionName() const { return m_SessionName; }
 
+        bool SendData(const std::string& mediaName, uint16_t compId, const void *pData, uint32_t size);
         uint64_t Tiebreaker() const { return m_Tiebreaker; }
 
     private:
-        static void ConnectivityCheckThread(Session * pThis, const StreamInfo* streamInfo, CandPeerContainer * peers);
+        bool ConnectivityCheck(const std::string& offer);
+        void OnMediaConnectivityCheck(Media* media, bool bRet, MediaContainer *medias);
 
     private:
+        enum class CheckStatus {
+            init,
+            ongoing,
+            done,
+            failed,
+        };
+
+    private:
+        CheckStatus m_CheckStatus;
         std::condition_variable m_ConnCheckCond;
+        std::mutex  m_MediaMutex;
+        MediaContainer m_Medias;
+
 
         std::string m_Offer;
         std::string m_Answer;
-        MediaContainer m_Medias;
-        CheckContainer m_CheckList;
 
         /* rfc5245 15.4 */
         std::string m_RemoteUserFrag;

@@ -7,6 +7,7 @@
 #include "config.h"
 
 #include "pg_log.h"
+#include "pg_util.h"
 
 #include <boost/asio.hpp>
 
@@ -80,12 +81,15 @@ namespace ICE {
         m_Tiebreaker(PG::GenerateRandom64()),
         m_DefaultIP(Configuration::Instance().DefaultIP()),
         m_Username(userName), m_SessionName(sessionName),
-        m_bControlling(true)
+        m_bControlling(true),
+        m_CheckStatus(CheckStatus::init)
     {
     }
 
     Session::~Session()
     {
+        for (auto itor = m_Medias.begin(); itor != m_Medias.end(); ++itor)
+            delete itor->second;
     }
 
     void Session::SetControlling(bool bControlling)
@@ -108,19 +112,18 @@ namespace ICE {
             return false;
         }
 
-        std::auto_ptr<Media> media(new Media(*this));
+        std::auto_ptr<Media> media(mediaAttr.m_Multiplexed ? new MultiplexStream(*this) : new Media(*this));
         if (!media.get())
         {
             LOG_ERROR("Session", "Failed to Media [%s]", mediaAttr.m_Name.c_str());
             return false;
         }
 
-
         for (auto itor = mediaAttr.m_StreamAttrs.begin(); itor != mediaAttr.m_StreamAttrs.end(); ++itor)
         {
-            if (!media->CreateStream(itor->m_CompId, itor->m_Protocol, itor->m_HostIP, itor->m_HostPort))
+            if (!media->CreateStream(itor->m_CompId, itor->m_Protocol, itor->m_HostIP, itor->m_HostPort, itor->m_RxCB))
             {
-                LOG_ERROR("Session", "Media [%s] failed to Create Stream [%d] [%s:%d]", mediaAttr.m_Name, itor->m_CompId, itor->m_HostIP.c_str(), itor->m_HostPort);
+                LOG_ERROR("Session", "Media [%s] failed to Create Stream [%d] [%s:%d]", mediaAttr.m_Name.c_str(), itor->m_CompId, itor->m_HostIP.c_str(), itor->m_HostPort);
                 return false;
             }
         }
@@ -135,9 +138,23 @@ namespace ICE {
         return true;
     }
 
+    bool Session::SendData(const std::string & mediaName, uint16_t compId, const void * pData, uint32_t size)
+    {
+        std::unique_lock<decltype(m_MediaMutex)> locker(m_MediaMutex);
+        auto itor = m_Medias.find(mediaName);
+        assert(itor != m_Medias.end());
+        return itor->second->SendData(compId, pData, size);
+    }
+
     bool Session::ConnectivityCheck(const std::string & offer)
     {
         CSDP sdp;
+
+        {
+            std::lock_guard<decltype(m_MediaMutex)> locker(m_MediaMutex);
+            assert(m_CheckStatus == CheckStatus::init);
+            m_CheckStatus = CheckStatus::ongoing;
+        }
 
         LOG_INFO("Session", "remote offer :%s", offer.c_str());
 
@@ -149,8 +166,13 @@ namespace ICE {
         }
 
         // make check list
+        using CheckContainer      = std::map<Stream*, CandPeerContainer*>;
+        using MediaCheckContainer = std::map<Media*,   CheckContainer*>;
+
         auto remoteMedias = sdp.GetRemoteMedia();
         int16_t total_cand_pairs = 0;
+
+        MediaCheckContainer mediaCheckList;
         for (auto lmedia_itor = m_Medias.begin(); lmedia_itor != m_Medias.end(); ++lmedia_itor)
         {
             auto rmedia_itor = remoteMedias.find(lmedia_itor->first);
@@ -161,16 +183,25 @@ namespace ICE {
             }
 
             auto lmedia = lmedia_itor->second;
-
             assert(lmedia);
 
-            auto & lstreams_container = lmedia->GetStreams();
-            auto rmedia = rmedia_itor->second;
-            for (auto lstream_itor = lstreams_container.begin(); lstream_itor != lstreams_container.end(); ++lstream_itor)
+            std::auto_ptr<CheckContainer> checkContainer(new CheckContainer);
+            
+            if (!checkContainer.get() || !mediaCheckList.insert(std::make_pair(lmedia, checkContainer.get())).second)
             {
-                auto lstream = lstream_itor->second;
+                LOG_ERROR("Session", "Create Media CheckList failed [%s]", rmedia_itor->first.c_str());
+                return false;
+            }
+
+            auto & lstreams = lmedia->GetStreams();
+            auto rmedia = rmedia_itor->second;
+            for (auto lstreams_itor = lstreams.begin(); lstreams_itor != lstreams.end(); ++lstreams_itor)
+            {
+                assert(lstreams_itor->second);
+                auto lstream = lstreams_itor->second;
                 auto rcand_container = rmedia->Candidates();
                 auto rcand_itor = rcand_container.find(lstream->ComponentId());
+
                 if (rcand_itor == rcand_container.end())
                 {
                     LOG_ERROR("Session", "remote [%s] media has no [%d] component", lstream->ComponentId(), lmedia_itor->first.c_str());
@@ -195,9 +226,9 @@ namespace ICE {
                 if (candPeerContainer->empty())
                 {
                     LOG_ERROR("Session", "[%s] media has no candidate peers", lmedia_itor->first.c_str());
-                    return false;
+                    continue;
                 }
-                else if (!m_CheckList.insert(std::make_pair(StreamInfo(lstream,lmedia->IcePwd(), rmedia->IcePassword(),lmedia->IceUfrag(),rmedia->IceUfrag()), candPeerContainer.get())).second)
+                else if (!checkContainer->insert(std::make_pair(lstream, candPeerContainer.get())).second)
                 {
                     LOG_ERROR("Session", "[%s] media cannot create Check List", lmedia_itor->first.c_str());
                     return false;
@@ -208,7 +239,7 @@ namespace ICE {
                 {
                     auto rcand = itor->RCandidate();
                     auto lcand = itor->LCandidate();
-                    LOG_ERROR("Session","lcand: [%d] => [%s:%d], [%s:%d] \n rcand: [%d] => [%s:%d], [%s:%d]",
+                    LOG_ERROR("Session", "lcand: [%d] => [%s:%d], [%s:%d] \n rcand: [%d] => [%s:%d], [%s:%d]",
                         lcand.m_CandType,
                         lcand.m_BaseIP.c_str(), lcand.m_BasePort,
                         lcand.m_ConnIP.c_str(), lcand.m_ConnPort,
@@ -219,69 +250,91 @@ namespace ICE {
                 candPeerContainer.release();
             }
 
+            checkContainer.release();
             lmedia->SetRIcePwd(rmedia->IcePassword());
             lmedia->SetRIceUfrag(rmedia->IceUfrag());
         }
 
-        if (total_cand_pairs == 0 || total_cand_pairs > Configuration::Instance().CandPairsLimits())
+        MediaContainer medias(m_Medias.begin(), m_Medias.end());
+        for (auto itor = m_Medias.begin(); itor != m_Medias.end(); ++itor)
         {
-            LOG_ERROR("Session", "too much candidate pairs [%d]", total_cand_pairs);
-            std::for_each(m_CheckList.begin(), m_CheckList.end(), [](auto &elem) {
-                delete elem.second;
-            });
-            return false;
+            assert(itor->second);
+            auto media = itor->second;
+            auto media_itor = mediaCheckList.find(media);
+            assert(media_itor != mediaCheckList.end() && media_itor->second);
+
+            media->ConnectivityCheck(*media_itor->second,
+                std::bind(&Session::OnMediaConnectivityCheck, this, std::placeholders::_1, std::placeholders::_2, &medias));
         }
 
-        // connectivity check
-        using Threads = std::vector<std::thread>;
-        Threads ConnCheckThrds;
-        for (auto check_itor = m_CheckList.begin(); check_itor != m_CheckList.end(); ++check_itor)
-        {
-            assert(check_itor->second);
-
-            ConnCheckThrds.push_back(std::thread(ConnectivityCheckThread, this, &check_itor->first, check_itor->second));
-
-            std::mutex mutex;
-            std::unique_lock<decltype(mutex)> locker(mutex);
-            m_ConnCheckCond.wait_for(locker, std::chrono::milliseconds(Configuration::Instance().Ta()));
-        }
-
-        // wait all checking done
-
-        std::for_each(ConnCheckThrds.begin(), ConnCheckThrds.end(), [](auto &itor) {
-            if (itor.joinable())
-                itor.join();
+        std::unique_lock<decltype(m_MediaMutex)> locker(m_MediaMutex);
+        m_ConnCheckCond.wait(locker, [this]() {
+            return this->m_CheckStatus == CheckStatus::done || this->m_CheckStatus == CheckStatus::failed;
         });
 
-        return true;
+        for (auto media_itor = mediaCheckList.begin(); media_itor != mediaCheckList.end(); ++media_itor)
+        {
+            auto check_container = media_itor->second;
+            assert(check_container);
+            for (auto check_itor = check_container->begin(); check_itor != check_container->end(); ++check_itor)
+                delete check_itor->second;
+
+            delete check_container;
+        }
+
+        assert(m_CheckStatus == CheckStatus::done || m_CheckStatus == CheckStatus::failed);
+
+        return m_CheckStatus == CheckStatus::done;
     }
 
-    bool Session::MakeOffer(std::string & offer)
+    void Session::OnMediaConnectivityCheck(Media *media, bool bRet, MediaContainer *medias)
+    {
+        assert(medias);
+
+        std::lock_guard<decltype(m_MediaMutex)> locker(m_MediaMutex);
+        bool bFound = false;
+        auto itor = medias->begin();
+        for (; itor != medias->end(); ++itor)
+        {
+            if (itor->second == media)
+            {
+                bFound = true;
+                break;
+            }
+        }
+
+        assert(bFound);
+
+        if (!bRet)
+        {
+            LOG_ERROR("Session", "Connectivity check failed : %s", itor->first.c_str());
+            m_CheckStatus = CheckStatus::failed;
+        }
+
+        medias->erase(itor);
+        if (medias->empty())
+        {
+            if (m_CheckStatus != CheckStatus::failed)
+                m_CheckStatus = CheckStatus::done;
+            m_ConnCheckCond.notify_one();
+        }
+    }
+
+    const std::string& Session::MakeOffer()
     {
         CSDP sdp;
-        auto ret = sdp.EncodeOffer(*this, m_Offer);
-        offer = m_Offer;
-        return ret;
+        sdp.EncodeOffer(*this, m_Offer);
+        return m_Offer;
     }
 
-    bool Session::MakeAnswer(const std::string & remoteOffer, std::string & answer)
+    const std::string& Session::MakeAnswer(const std::string & remoteOffer)
     {
         auto ret = ConnectivityCheck(remoteOffer);
         if (!ret)
-            return false;
+            return m_Answer;
 
         CSDP sdp;
-        ret = sdp.EncodeAnswer(*this, m_Offer, m_Answer);
-        answer = m_Answer;
-        return ret;
-    }
-
-    void Session::ConnectivityCheckThread(Session * pThis, const StreamInfo* streamInfo, CandPeerContainer * peers)
-    {
-        assert(pThis && peers && streamInfo);
-
-        auto ret = streamInfo->m_pStream->ConnectivityCheck(*peers);
-
-        pThis->m_ConnCheckCond.notify_one();
+        sdp.EncodeAnswer(*this, m_Offer, m_Answer);
+        return m_Answer;
     }
 }

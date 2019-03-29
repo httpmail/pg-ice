@@ -1,3 +1,6 @@
+
+*.TMP
+Release/
 Debug/*.*
 ice/Debug/
 ice/abc.log
@@ -9,3 +12,4 @@ ice/x64/
 ice.VC.db
 ice.VC.db
 ice.VC.db
+*.db

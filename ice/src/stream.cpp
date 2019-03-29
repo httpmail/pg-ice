@@ -10,8 +10,8 @@ namespace {
     using namespace ICE;
     using TimeoutContainer = std::vector<uint32_t>;
 
-    static TimeoutContainer sUDPTimeout = { 500, 800, 800};//{ 500, 1000, 2000, 4000, 8000, 16000, 8000 };
-    static TimeoutContainer sTCPTimeout = { 39500 };
+    static TimeoutContainer sUDPTimeout = { 500, 1000, 2000, 4000, 8000, 16000, 8000 };
+    static TimeoutContainer sTCPTimeout = { 395000 };
     static const uint16_t sNominatingTimeout = 10; // 10 seconds
 
     Candidate * CreateSvrCandidate(Protocol protocol,
@@ -245,13 +245,24 @@ namespace {
 
     public:
         CheckSession(ICE::Session &sess, ICE::Media &media, DataCarrier &dataCarrier, const ICE::CandidatePeer &peer, const TimeoutContainer &timer) :
-            m_Carrier(dataCarrier), m_Timer(timer), m_Peer(peer),m_Session(sess), m_Media(media)
+            m_Carrier(dataCarrier), m_Timer(timer), m_Peer(peer),m_Session(sess), m_Media(media),m_pMsg(nullptr)
         {
             STUN::MessagePacket::GenerateRFC5389TransationId(m_Id);
         }
-
-        virtual ~CheckSession() 
+        virtual ~CheckSession()
         {
+            m_bWaitResp = false;
+            m_SendCond.notify_one();
+
+            if (m_SendThrd.joinable())
+                m_SendThrd.join();
+
+            std::lock_guard<decltype(m_pMsgMutex)> locker(m_pMsgMutex);
+            if (m_pMsg)
+            {
+                delete m_pMsg;
+                m_pMsg = nullptr;
+            }
         }
 
     public:
@@ -259,9 +270,15 @@ namespace {
         {
             assert(callback);
 
+            if (m_SendThrd.joinable())
+                m_SendThrd.join();
+
             std::lock_guard<decltype(m_pMsgMutex)> locker(m_pMsgMutex);
 
             m_Callback = callback;
+            if (m_pMsg)
+                delete m_pMsg;
+
             m_pMsg = new STUN::SubBindReqMsg(m_Peer.LCandidate().m_Priority,
                 m_Id,
                 m_Session.IsControlling(),
@@ -280,10 +297,8 @@ namespace {
 
             m_pMsg->Finalize();
 
-            auto send_thrd = std::thread(&CheckSession::SendThread, this);
-            send_thrd.detach();
+            m_SendThrd = std::thread(&CheckSession::SendThread, this);
         }
-
         bool operator < (const CheckSession &other) const
         {
             if (this == &other)
@@ -294,13 +309,31 @@ namespace {
             else
                 return m_Peer.Priority() > other.m_Peer.Priority();
         }
-
-        void OnDataCarrierRecved(const void *pData, uint32_t bytes)
+        void OnDataCarrierRecved(const void *pData, int32_t bytes)
         {
-            assert(pData && bytes);
-
             using namespace STUN;
+            class DataGuard {
+            public:
+                DataGuard(const void *& pData) :
+                    m_pData(pData)
+                {
 
+                }
+
+                ~DataGuard()
+                {
+                    DataCarrier::Dealloc(m_pData);
+                }
+                const void *& m_pData;
+            };
+
+            if (pData == nullptr && bytes == 0)
+            {
+                OnConnectionLost();
+                return;
+            }
+
+            DataGuard dataGuard(pData);
             auto packet = reinterpret_cast<const STUN::PACKET::stun_packet*>(pData);
             if (!MessagePacket::IsValidStunPacket(*packet, bytes))
                 return;
@@ -311,12 +344,10 @@ namespace {
                 return;
             }
 
+            if (0 != memcmp(m_Id, packet->TransId(), STUN::sTransationLength))
             {
-                if (0 != memcmp(m_Id, packet->TransId(), STUN::sTransationLength))
-                {
-                    LOG_ERROR("CheckSession", "unmatched Transation id");
-                    return;
-                }
+                LOG_ERROR("CheckSession", "unmatched Transation id");
+                return;
             }
 
             switch (packet->MsgId())
@@ -334,15 +365,14 @@ namespace {
                 break;
             }
         }
-
         const ICE::CandidatePeer& GetCandPeer() const { return m_Peer; }
+
     private:
         static void SendThread(CheckSession *pThis)
         {
             assert(pThis);
 
             std::mutex send_mutex;
-
             auto & receiver = pThis->m_Peer.RCandidate().m_ConnIP;
             auto port       = pThis->m_Peer.RCandidate().m_ConnPort;
             bool bTimeout       = true;
@@ -352,17 +382,29 @@ namespace {
             {
                 {
                     std::lock_guard<decltype(pThis->m_pMsgMutex)> locker(pThis->m_pMsgMutex);
-                    pThis->m_Carrier.Send(pThis->m_pMsg->GetData(), pThis->m_pMsg->GetLength(), receiver, port);
+                    auto status = pThis->m_Carrier.Send(pThis->m_pMsg->GetData(), pThis->m_pMsg->GetLength(), receiver, port, *itor);
+                    if (status == DataCarrier::send_status::failed)
+                    {
+                        LOG_ERROR("CheckSession", "Send Request failed");
+                        break;
+                    }
+                    else if (status == DataCarrier::send_status::timeout)
+                    {
+                        LOG_ERROR("CheckSession","Send Request timeout [%s:%d] -> [%s:%d]",
+                            pThis->m_Peer.LCandidate().m_BaseIP.c_str(), pThis->m_Peer.LCandidate().m_BasePort,
+                            receiver.c_str(), port);
+                        continue;
+                    }
+                    LOG_ERROR("CheckSession","Send Request OK [%s:%d] -> [%s:%d]",
+                        pThis->m_Peer.LCandidate().m_BaseIP.c_str(),pThis->m_Peer.LCandidate().m_BasePort,
+                        receiver.c_str(), port);
                 }
 
                 try
                 {
                     std::unique_lock<decltype(send_mutex)> locker(send_mutex);
-                    auto ret = pThis->m_SendCond.wait_for(locker, std::chrono::milliseconds(*itor), [pThis]() {
-                        return !pThis->m_bWaitResp;
-                    });
-
-                    if (ret)
+                    if(pThis->m_SendCond.wait_for(locker, std::chrono::milliseconds(*itor), [pThis]() {
+                        return !pThis->m_bWaitResp;}))
                     {
                         bTimeout = false;
                         break;
@@ -386,13 +428,26 @@ namespace {
         }
 
     private:
+        void OnConnectionLost()
+        {
+            assert(m_Callback);
+            LOG_ERROR("CheckSession", "OnConnectionLost %p", this);
+            m_bWaitResp = false;
+            m_SendCond.notify_one();
+            m_Callback(Status::failed, *this, m_Peer);
+        }
         void OnStunMessage(const STUN::SubBindReqMsg &msg)
         {
             using namespace STUN;
+            assert(m_Callback);
             //RFC8445 [7.1.  STUN Extensions]
             const ATTR::Role *pRole(nullptr);
             const ATTR::Priority *pPriority(nullptr);
             const ATTR::UseCandidate *pUseCandidate(nullptr);
+
+            LOG_ERROR("CheckSession","OnStunMessage->SubBindReqMsg [%s:%d] -> [%s:%d]",
+                m_Peer.LCandidate().m_BaseIP.c_str(), m_Peer.LCandidate().m_BasePort,
+                m_Peer.RCandidate().m_ConnIP.c_str(), m_Peer.RCandidate().m_ConnPort);
 
             if (!msg.GetAttribute(pRole) && !msg.GetAttribute(pPriority))
             {
@@ -415,7 +470,18 @@ namespace {
                 auto & receiver = m_Peer.RCandidate().m_ConnIP;
                 auto port = m_Peer.RCandidate().m_ConnPort;
 
-                if (!msg.GetAttribute(pMsgIntegrity) || !msg.GetAttribute(pUsername))
+                std::string username;
+                if (msg.GetAttribute(pUsername))
+                {
+                    username = pUsername->Name();
+                    auto pos = username.find('\0');
+                    if (pos != std::string::npos)
+                    {
+                        username = username.substr(0, pos);
+                    }
+
+                }
+                if (!msg.GetAttribute(pMsgIntegrity) || !pUsername)
                 {
                     LOG_ERROR("CheckSession", "400 MessageIntegrity unmatched");
                     // 400 bad request
@@ -424,12 +490,12 @@ namespace {
                     m_Carrier.Send(errRespMsg.GetData(), errRespMsg.GetLength(),receiver, port);
                     m_Callback(Status::failed, *this, m_Peer);
                 }
-                else if ((m_Media.IceUfrag() + ":" + m_Media.RIceUfrag()) != pUsername->Name())
+                else if ((m_Media.IceUfrag() + ":" + m_Media.RIceUfrag()) != username)
                 {
                     // 401 Unauthorized
                     SubBindErrRespMsg errRespMsg(msg.TransationId(), 4, 1, "unmatched-username");
                     errRespMsg.Finalize();
-                    m_Carrier.Send(errRespMsg.GetData(), errRespMsg.GetLength(), receiver, port);
+                    //m_Carrier.Send(errRespMsg.GetData(), errRespMsg.GetLength(), receiver, port);
                     m_Callback(Status::failed, *this, m_Peer);
                 }
                 else if (!MessagePacket::VerifyMsgIntegrity(msg, m_Media.IcePwd()))
@@ -454,6 +520,7 @@ namespace {
                     if ((m_Session.IsControlling() && m_Session.Tiebreaker() >= pRole->TieBreaker()) ||
                         (!m_Session.IsControlling() && m_Session.Tiebreaker() < pRole->TieBreaker()))
                     {
+                        LOG_ERROR("CheckSession", "Role Conflict!!!");
                         SubBindErrRespMsg errRespMsg(msg.TransationId(), 4, 87, "Role-Conflict");
                         errRespMsg.Finalize();
                         m_Carrier.Send(errRespMsg.GetData(), errRespMsg.GetLength(), receiver, port);
@@ -487,11 +554,10 @@ namespace {
                 }
             }
         }
-
         void OnStunMessage(const STUN::SubBindRespMsg &msg)
         {
             using namespace STUN;
-
+            assert(m_Callback);
             const ATTR::MessageIntegrity *pMsgIntegrity(nullptr);
 
             if (!msg.GetAttribute(pMsgIntegrity) || !MessagePacket::VerifyMsgIntegrity(msg, m_Media.RIcePwd()))
@@ -520,43 +586,23 @@ namespace {
                 m_SendCond.notify_one();
                 m_Callback(Status::failed, *this, m_Peer);
             }
-            else if (msg.GetAttribute(pXorMapAddr) &&
-                pXorMapAddr->IP() == m_Peer.LCandidate().m_BaseIP &&
-                pXorMapAddr->Port() == m_Peer.LCandidate().m_BasePort)
+            else if (!msg.GetAttribute(pXorMapAddr))
             {
-                /*
-                RFC5245 [7.1.3.1.  Failure Cases]
-                The agent MUST check that the source IP address and port of the
-                response equal the destination IP address and port to which the
-                Binding request was sent, and that the destination IP address and
-                port of the response match the source IP address and port from which
-                the Binding request was sent.  In other words, the source and
-                destination transport addresses in the request and responses are
-                symmetric.  If they are not symmetric, the agent sets the state of
-                the pair to Failed.
-                */
-                m_bWaitResp = false;
-                m_SendCond.notify_one();
-                m_Callback(Status::passed, *this, m_Peer);
-            }
-            else
-            {
-                if (pXorMapAddr)
-                {
-                    LOG_ERROR("CheckSession", "No XormappAddress or no symmetric address[%s:%d]",
-                        pXorMapAddr->IP().c_str(), pXorMapAddr->Port());
-                }
-
                 m_bWaitResp = false;
                 m_SendCond.notify_one();
                 m_Callback(Status::failed, *this, m_Peer);
             }
+            else
+            {
+                m_bWaitResp = false;
+                m_SendCond.notify_one();
+                m_Callback(Status::passed, *this, m_Peer);
+            }
         }
-
         void OnStunMessage(const STUN::SubBindErrRespMsg &msg)
         {
             using namespace STUN;
-
+            assert(m_Callback);
             const ATTR::ErrorCode *pErrCode(nullptr);
             const ATTR::MessageIntegrity *pMsgIntegrity(nullptr);
 
@@ -575,8 +621,10 @@ namespace {
                 applicable, will continue.
                 */
                 LOG_WARNING("CheckSession", "SubErrRespMsg cannot be authenticated");
+                return;
             }
-            else if (!msg.GetAttribute(pErrCode))
+
+            if (!msg.GetAttribute(pErrCode))
             {
                 /*
                 there is no error code, invalid error resp message, set the status to failed
@@ -585,6 +633,7 @@ namespace {
                 m_bWaitResp = false;
                 m_SendCond.notify_one();
                 m_Callback(Status::failed, *this, m_Peer);
+                return;
             }
 
             auto errorCode = pErrCode->Code();
@@ -620,7 +669,7 @@ namespace {
                 /*
                 o  If the error code is 500 through 599, the client MAY resend the
                 request; clients that do so MUST limit the number of times they do
-                this.
+                pThis->
                 */
             }
         }
@@ -646,29 +695,52 @@ namespace {
 
 namespace ICE {
     ////////////////////////////////////// class Stream //////////////////////////////////////
-    Stream::Stream(Session& session, Media &media, uint16_t comp_id, Protocol protocol, const std::string& defaultIP, uint16_t defaultPort)
+    Stream::Stream(Session& session, Media &media, uint16_t comp_id, Protocol protocol, const std::string& defaultIP, uint16_t defaultPort, OnRxCB rxCB)
         : m_Session(session), m_Media(media),m_Status(Status::init), m_ComponentId(comp_id), m_Protocol(protocol),m_DefaultIP(defaultIP),m_DefaultPort(defaultPort)
     {
+        assert(rxCB != nullptr);
+        m_ActiveChannel._rx_cb = rxCB;
     }
 
     Stream::~Stream()
     {
-        m_Status = Status::quit;
+        LOG_ERROR("Stream","~Stream  enter %p", this);
+        assert(!IsStatus(Status::checking));
 
+        SetStatus(Status::quit);
+        m_KeepAliveCond.notify_one();
         if (m_KeepAliveThrd.joinable())
             m_KeepAliveThrd.join();
+        {
+            std::lock_guard<decltype(m_CandChannelsMutex)> locker(m_CandChannelsMutex);
+            for (auto itor = m_CandChannels.begin(); itor != m_CandChannels.end(); ++itor)
+            {
+                assert(itor->first);
+                assert(itor->second);
+                delete itor->first;
+                delete itor->second;
+            }
+        }
 
-        m_ActiveChannel._channel->Close();
+        {
+            std::lock_guard<decltype(m_ActiveMutex)> locker(m_ActiveMutex);
+            if (m_ActiveChannel._bValid)
+            {
+                assert(m_ActiveChannel._channel && m_ActiveChannel._dataCarrier && m_ActiveChannel._lcand);
+                m_ActiveChannel._channel->Close();
+                m_ActiveChannel._dataCarrier->Stop();
+                delete m_ActiveChannel._channel;
+                delete m_ActiveChannel._dataCarrier;
+                delete m_ActiveChannel._lcand;
+            }
+        }
 
-        delete m_ActiveChannel._dataCarrier;
-        delete m_ActiveChannel._lcand;
-        delete m_ActiveChannel._channel;
+        LOG_ERROR("Stream", "~Stream  leave %p", this);
     }
 
     bool Stream::GatherCandidates()
     {
-        assert(m_Status == Status::init);
-        m_Status = Status::gathering;
+        assert(IsStatus(Status::init) || IsStatus(Status::gatheringdone));
 
         struct GatherSessInfo
         {
@@ -679,8 +751,7 @@ namespace ICE {
         using ChannelSessionMap = std::unordered_map<Channel*, GatherSessInfo >;
 
         auto& stunServers = Configuration::Instance().StunServer();
-        auto& portRange = Configuration::Instance().GetPortRange();
-
+        auto& portRange   = Configuration::Instance().GetPortRange();
 
         ChannelSessionMap gatherSessions,failedSessions, passedSessions;
 
@@ -720,7 +791,6 @@ namespace ICE {
                         channel.IP().c_str(), channel.Port(),
                         channel.PeerIP().c_str(), channel.PeerPort());
 
-                    // set ret == false
                     bRet = false;
                 }
 
@@ -797,6 +867,7 @@ namespace ICE {
         {
             delete itor->first;
             assert(!itor->second.cand);
+            delete itor->second.cand;
         }
 
         // gather host cand
@@ -816,15 +887,16 @@ namespace ICE {
             }
         }
 
-        m_Status = Status::gatheringdone;
+        SetStatus(Status::gatheringdone);
+        std::lock_guard<decltype(m_CandChannelsMutex)> cand_locker(m_CandChannelsMutex);
         return m_CandChannels.size() > 0;
     }
 
     bool Stream::ConnectivityCheck(const CandPeerContainer & CandPeers)
     {
-        assert(CandPeers.size() && m_Status == Status::gatheringdone && m_CandChannels.size());
-        m_Status = Status::checking;
-
+        assert(CandPeers.size() && IsStatus(Status::gatheringdone));
+        SetStatus(Status::checking);
+        LOG_INFO("Connectivity", "ConnectivityCheck->enter %p", this);
         struct CheckSessCmp
         {
             bool operator()(const CheckSession* s1, const CheckSession* s2) const
@@ -834,14 +906,14 @@ namespace ICE {
         };
 
         using DataCarrierMap = std::map<const Channel*, DataCarrier*>;
-        using CheckSessions = std::set<CheckSession*, CheckSessCmp>;
+        using CheckSessions  = std::set<CheckSession*, CheckSessCmp>;
 
         struct Delegate {
             void OnCheckSessionDone(CheckSession::Status bRet, CheckSession& session, const CandidatePeer& peer)
             {
                 std::lock_guard<decltype(m_checkMutex)> locker(m_checkMutex);
 
-                LOG_ERROR("Stream", "[%s:%d]=>[%s:%d] %s",
+                LOG_ERROR("Stream", "OnCheckSessionDone [%s:%d]=>[%s:%d] %s",
                     peer.LCandidate().m_BaseIP.c_str(), peer.LCandidate().m_BasePort,
                     peer.RCandidate().m_ConnIP.c_str(), peer.RCandidate().m_ConnPort,
                     bRet == CheckSession::Status::failed ? "failed" : (bRet == CheckSession::Status::passed ? "passed" : "nominated"));
@@ -855,6 +927,7 @@ namespace ICE {
                 }
                 else
                 {
+                    assert(!m_pNominatingSession || m_pNominatingSession != &session);
                     m_pNominatingSession = &session;
                     m_SessionCond.notify_one();
                 }
@@ -883,7 +956,7 @@ namespace ICE {
             CheckSessions &m_CheckSessions;
             CheckSessions &m_FailedSessions;
             CheckSessions &m_PassedSessions;
-            CheckSession *&m_pNominatingSession;
+            CheckSession  *&m_pNominatingSession;
         };
 
         std::mutex  checkMutex;
@@ -906,7 +979,8 @@ namespace ICE {
 
             if (carrier_itor == Carriers.end())
             {
-                carrier = new DataCarrier(*itor->second);
+                carrier = lcand.m_Protocol == Protocol::udp ?
+                    new DataCarrier(*itor->second) : new ConnectedDataCarrier(*itor->second, rcand.m_ConnIP, rcand.m_ConnPort);
                 if (!carrier || !Carriers.insert(std::make_pair(channel, carrier)).second)
                 {
                     delete carrier;
@@ -921,6 +995,7 @@ namespace ICE {
 
             assert(carrier);
             CheckSession *sess = new CheckSession(m_Session, m_Media, *carrier, *peer_itor, m_Protocol == Protocol::udp ? sUDPTimeout : sTCPTimeout);
+
             if (!sess)
             {
                 LOG_ERROR("Stream", "ConnectivityCheck, Create CheckSession failed [%s:%d]=>[%s:%d]",
@@ -951,130 +1026,142 @@ namespace ICE {
             }
         }
 
-        if (Carriers.empty() || checkSessions.empty())
-        {
-            std::for_each(Carriers.begin(), Carriers.end(), [](auto &itor) {
-                delete itor.second;
-            });
+        auto ClearResourceFunc = [&Carriers, &checkSessions, this]() {
 
-            std::for_each(checkSessions.begin(), checkSessions.end(), [](auto &itor) {
-                delete itor;
-            });
-
-            ReleaseCandidateChannel();
-
-            m_Status = Status::checkingdone;
-            return false;
-        }
-
-        std::for_each(Carriers.cbegin(), Carriers.cend(), [](auto &itor) {
-            itor.second->Start();
-        });
-
-        Delegate checkDelegate = {
-            checkMutex,
-            checkCond,
-            checkSessions,
-            failedSessions,
-            passedSessions,
-            pNominatedSession };
-
-        for (auto itor = checkSessions.begin(); itor != checkSessions.end(); ++itor)
-        {
-            assert(*itor);
-            (*itor)->Start(false, std::bind(&Delegate::OnCheckSessionDone, &checkDelegate,
-                std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
-        }
-
-        // wait session check done
-        {
-            std::unique_lock<decltype(checkMutex)> locker(checkMutex);
-            checkCond.wait(locker, [this, &checkSessions, &passedSessions, &failedSessions, pNominatedSession]() {
-                return (checkSessions.size() == (passedSessions.size() + failedSessions.size())) || pNominatedSession;
-            });
-        }
-
-        if (m_Session.IsControlling())
-        {
-            assert(!pNominatedSession && checkSessions.size() == (passedSessions.size() + failedSessions.size()));
-
-            if (passedSessions.size())
+            for (auto itor = this->m_CandChannels.begin(); itor != this->m_CandChannels.end(); ++itor)
             {
-                auto session = *passedSessions.begin();
-                passedSessions.erase(session);
+                assert(itor->first && itor->second);
+                itor->second->Close(); // close channel
+            }
 
-                session->Start(true, std::bind(&Delegate::OnCheckSessionNominating, &checkDelegate,
+            for (auto itor = Carriers.begin(); itor != Carriers.end(); ++itor)
+            {
+                delete itor->second;
+            }
+
+            for (auto itor = checkSessions.begin(); itor != checkSessions.end(); ++itor)
+            {
+                delete *itor;
+            }
+
+            LOG_ERROR("Stream","All session close");
+            // now we could release all the invalid channels
+            std::lock_guard<decltype(m_CandChannelsMutex)> locker(m_CandChannelsMutex);
+            for (auto itor = this->m_CandChannels.begin(); itor != this->m_CandChannels.end(); ++itor)
+            {
+                assert(itor->first && itor->second);
+                delete itor->first;
+                delete itor->second;
+            }
+
+            this->m_CandChannels.clear();
+        };
+
+        if (Carriers.size() || checkSessions.size())
+        {
+
+            Delegate checkDelegate = {
+                checkMutex,
+                checkCond,
+                checkSessions,
+                failedSessions,
+                passedSessions,
+                pNominatedSession };
+
+            for (auto itor = checkSessions.begin(); itor != checkSessions.end(); ++itor)
+            {
+                assert(*itor);
+                (*itor)->Start(false, std::bind(&Delegate::OnCheckSessionDone, &checkDelegate,
                     std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+            }
 
+            // start Carriers after session started
+            std::for_each(Carriers.cbegin(), Carriers.cend(), [](auto &itor) {
+                itor.second->Start();
+            });
+
+            LOG_INFO("Stream","Connectivity check check [%p] [%d] [%d]", this, checkSessions.size(),Carriers.size());
+            // wait session check done
+            {
                 std::unique_lock<decltype(checkMutex)> locker(checkMutex);
-                checkCond.wait(locker);
+                checkCond.wait(locker, [this, &checkSessions, &passedSessions, &failedSessions, &pNominatedSession]() {
+
+                    LOG_INFO("Stream", "Connectivity check wake up [%p] [%d] [%d] [%d]", this, checkSessions.size(), passedSessions.size(), failedSessions.size());
+                    return (checkSessions.size() == (passedSessions.size() + failedSessions.size())) || pNominatedSession;
+                });
+            }
+
+            LOG_INFO("Stream", "Connectivity Check done total: [%d] passed [%d] failed [%d] ongoing [%d]",
+                checkSessions.size(), passedSessions.size(), failedSessions.size(),
+                checkSessions.size() - passedSessions.size() - failedSessions.size());
+
+            if (checkSessions.size() != failedSessions.size())
+            {
+                if (m_Session.IsControlling())
+                {
+                    assert(!pNominatedSession && checkSessions.size() == (passedSessions.size() + failedSessions.size()));
+
+                    if (passedSessions.size())
+                    {
+                        auto session = *passedSessions.begin();
+                        passedSessions.erase(session);
+
+                        session->Start(true, std::bind(&Delegate::OnCheckSessionNominating, &checkDelegate,
+                            std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+
+                        std::unique_lock<decltype(checkMutex)> locker(checkMutex);
+                        checkCond.wait(locker);
+                    }
+                }
+                else if (!pNominatedSession)
+                {
+                    LOG_INFO("Stream", "Connectivity Check has been done, wait for nominating (%ds) ", sNominatingTimeout);
+                    std::unique_lock<decltype(checkMutex)> locker(checkMutex);
+                    checkCond.wait_for(locker, std::chrono::seconds(sNominatingTimeout));
+                }
+                if (pNominatedSession)
+                {
+                    assert(checkSessions.find(pNominatedSession) != checkSessions.end());
+
+                    auto peer = pNominatedSession->GetCandPeer();
+                    auto cand_itor = m_CandChannels.find(&peer.LCandidate());
+
+                    assert(cand_itor != m_CandChannels.end() && cand_itor->second);
+
+                    LOG_INFO("Stream", "Actived Channel [%s:%d]=>[%s:%d]",
+                        peer.LCandidate().m_BaseIP.c_str(), peer.LCandidate().m_BasePort,
+                        peer.RCandidate().m_ConnIP.c_str(), peer.RCandidate().m_ConnPort);
+
+                    std::lock_guard<decltype(m_ActiveMutex)> locker(m_ActiveMutex);
+                    m_ActiveChannel._bValid = true;
+                    m_ActiveChannel._lcand = &peer.LCandidate();
+                    m_ActiveChannel._rcand_ip = peer.RCandidate().m_ConnIP;
+                    m_ActiveChannel._rcand_port = peer.RCandidate().m_ConnPort;
+                    m_ActiveChannel._channel = cand_itor->second;
+
+                    auto carrier_itor = Carriers.find(m_ActiveChannel._channel);
+                    assert(carrier_itor != Carriers.end() && carrier_itor->second);
+
+                    carrier_itor->second->Unregister();
+
+                    m_ActiveChannel._dataCarrier = carrier_itor->second;
+                    m_ActiveChannel._dataCarrier->Register(peer.RCandidate().m_ConnIP, peer.RCandidate().m_ConnPort,
+                        std::bind(&Stream::OnDataReceived, this, std::placeholders::_1, std::placeholders::_2));
+
+                    m_KeepAliveThrd = std::thread(KeepAliveThread, this);
+
+                    // remove from container
+                    Carriers.erase(carrier_itor);
+                    m_CandChannels.erase(cand_itor);
+                }
             }
         }
-        else if (!pNominatedSession)
-        {
-            LOG_INFO("Stream", "Connectivity Check has been done, wait for nominating (%ds) ", sNominatingTimeout);
-            std::unique_lock<decltype(checkMutex)> locker(checkMutex);
-            checkCond.wait_for(locker, std::chrono::seconds(sNominatingTimeout));
-        }
 
-        LOG_INFO("Stream", "checkSessions [%d], passedSessions [%d], failedSessions[%d], nominatedSession [%p]",
-            checkSessions.size(), passedSessions.size(), failedSessions.size(), pNominatedSession);
-
-        if (pNominatedSession)
-        {
-            assert(checkSessions.find(pNominatedSession) != checkSessions.end());
-            checkSessions.erase(pNominatedSession);
-
-
-            auto peer = pNominatedSession->GetCandPeer();
-            auto cand_itor = m_CandChannels.find(&peer.LCandidate());
-
-            assert(cand_itor != m_CandChannels.end() && cand_itor->second);
-
-            LOG_INFO("Stream", "Actived Channel [%s:%d]=>[%s:%d]",
-                peer.LCandidate().m_BaseIP.c_str(), peer.LCandidate().m_BasePort,
-                peer.RCandidate().m_ConnIP.c_str(), peer.RCandidate().m_ConnPort);
-
-            m_ActiveChannel._lcand      = &peer.LCandidate();
-            m_ActiveChannel._rcand_ip   = peer.RCandidate().m_ConnIP;
-            m_ActiveChannel._rcand_port = peer.RCandidate().m_ConnPort;
-            m_ActiveChannel._channel    = cand_itor->second;
-
-            auto carrier_itor = Carriers.find(m_ActiveChannel._channel);
-            assert(carrier_itor != Carriers.end() && carrier_itor->second);
-
-            carrier_itor->second->Unregister();
-
-            m_ActiveChannel._dataCarrier = carrier_itor->second;
-            m_ActiveChannel._dataCarrier->Register(peer.RCandidate().m_ConnIP, peer.RCandidate().m_ConnPort,
-                std::bind(&Stream::OnDataReceived, this, std::placeholders::_1, std::placeholders::_2));
-
-            m_KeepAliveThrd = std::thread(KeepAliveThread, this);
-
-            // remove from container
-            Carriers.erase(carrier_itor);
-            m_CandChannels.erase(cand_itor);
-        }
-
-        std::for_each(m_CandChannels.begin(), m_CandChannels.end(), [](auto& itor) {
-            itor.second->Close();
-        });
-
-        std::for_each(Carriers.begin(), Carriers.end(), [](auto &itor) {
-            delete itor.second;
-        });
-
-        std::for_each(checkSessions.begin(), checkSessions.end(), [](auto &itor) {
-            delete itor;
-        });
-
-        ReleaseCandidateChannel();
-
-        LOG_INFO("Stream", "Connectivity Check has been completed [%s]",
-            (pNominatedSession != nullptr ? "Succeeded" : "Failed"));
-
-        m_Status = Status::checkingdone;
-        return pNominatedSession != nullptr;
+        ClearResourceFunc();
+        LOG_INFO("Connectivity", "ConnectivityCheck->leave %p", this);
+        SetStatus(Status::checkingdone);
+        std::lock_guard<decltype(m_ActiveMutex)> locker(m_ActiveMutex);
+        return m_ActiveChannel._bValid;
     }
 
     void Stream::GetCandidates(CandContainer & Cands) const
@@ -1086,6 +1173,54 @@ namespace ICE {
         });
     }
 
+    bool Stream::SendData(const void * pData, uint32_t size)
+    {
+        assert(m_ActiveChannel._channel && m_ActiveChannel._dataCarrier);
+        return DataCarrier::send_status::ok == m_ActiveChannel._dataCarrier->Send(pData, size, m_ActiveChannel._rcand_ip, m_ActiveChannel._rcand_port);
+    }
+
+    void Stream::Shutdown()
+    {
+        LOG_ERROR("Stream", "%p stream->close enter", this);
+        {
+            std::lock_guard<decltype(m_CandChannelsMutex)> locker(m_CandChannelsMutex);
+            for (auto itor = m_CandChannels.begin(); itor != m_CandChannels.end(); ++itor)
+            {
+                assert(itor->first && itor->second);
+                itor->second->Close();
+            }
+        }
+
+        {
+            std::lock_guard<decltype(m_ActiveMutex)> locker(m_ActiveMutex);
+            if (m_ActiveChannel._bValid)
+            {
+                assert(m_ActiveChannel._channel);
+                m_ActiveChannel._channel->Close();
+            }
+        }
+
+        std::unique_lock<decltype(m_StatusMutex)> locker(m_StatusMutex);
+        m_StatusCond.wait(locker, [this]() {
+            return this->m_Status != Status::checking;
+        });
+
+        LOG_ERROR("Stream", "%p stream->close leave", this);
+    }
+
+    void Stream::CancleConnectivityCheck()
+    {
+        if (IsStatus(Status::checking))
+        {
+            std::lock_guard<decltype(m_CandChannelsMutex)> locker(m_CandChannelsMutex);
+            for (auto itor = m_CandChannels.begin(); itor != m_CandChannels.end(); ++itor)
+            {
+                assert(itor->first && itor->second);
+                itor->second->Close();
+            }
+        }
+    }
+
     Channel * Stream::CreateChannel(Protocol protocol, const std::string & ip, uint16_t port)
     {
         switch (protocol)
@@ -1094,10 +1229,10 @@ namespace ICE {
             return CreateChannel<UDPChannel>(ip, port);
 
         case Protocol::tcp_act:
-            return CreateChannel<TCPChannel>(ip, port);
+            return CreateChannel<TCPChannel>(ip, port, true);
 
         case Protocol::tcp_pass:
-            return CreateChannel<TCPPassiveChannel>(ip, port);
+            return CreateChannel<TCPPassiveChannel>(ip, port, true);
 
         default:
             assert(0);
@@ -1113,10 +1248,10 @@ namespace ICE {
             return CreateChannel<UDPChannel>(ip, lowport, upperport, attempts);
 
         case Protocol::tcp_act:
-            return CreateChannel<TCPChannel>(ip, lowport, upperport, attempts);
+            return CreateChannel<TCPChannel>(ip, lowport, upperport, attempts, true);
 
         case Protocol::tcp_pass:
-            return CreateChannel<TCPPassiveChannel>(ip, lowport, upperport, attempts);
+            return CreateChannel<TCPPassiveChannel>(ip, lowport, upperport, attempts, true);
 
         default:
             assert(0);
@@ -1130,6 +1265,7 @@ namespace ICE {
         assert(pThis->m_ActiveChannel._channel && pThis->m_ActiveChannel._dataCarrier);
 
         uint16_t tr = Configuration::Instance().Tr();
+        std::mutex _mutex;
 
         while (pThis->m_Status != Status::quit)
         {
@@ -1139,16 +1275,10 @@ namespace ICE {
             msg.Finalize();
             pThis->m_ActiveChannel._dataCarrier->Send(msg.GetData(), msg.GetLength(),
                 pThis->m_ActiveChannel._rcand_ip, pThis->m_ActiveChannel._rcand_port);
-            std::this_thread::sleep_for(std::chrono::seconds(tr));
-        }
-    }
 
-    void Stream::ReleaseCandidateChannel()
-    {
-        std::for_each(m_CandChannels.begin(), m_CandChannels.end(), [](auto &itor) {
-            delete itor.first;
-            delete itor.second;
-        });
+            std::unique_lock<decltype(_mutex)> locker(_mutex);
+            pThis->m_KeepAliveCond.wait_for(locker, std::chrono::seconds(tr));
+        }
     }
 
     void Stream::OnDataReceived(const void * pData, uint32_t size)
@@ -1157,9 +1287,29 @@ namespace ICE {
             return;
 
         auto packet = reinterpret_cast<const STUN::PACKET::stun_packet*>(pData);
+
         if (!STUN::MessagePacket::IsValidStunPacket(*packet, size))
         {
+            assert(m_ActiveChannel._rx_cb);
+            m_ActiveChannel._rx_cb(pData, size);
         }
+        else
+            DataCarrier::Dealloc(packet);
     }
 
+    bool Stream::IsStatus(Status eStatus) const
+    {
+        std::lock_guard<decltype(m_StatusMutex)> locker(m_StatusMutex);
+        return m_Status == eStatus;
+    }
+
+    void Stream::SetStatus(Status eStatus)
+    {
+        std::lock_guard<decltype(m_StatusMutex)> locker(m_StatusMutex);
+        if (eStatus != m_Status)
+        {
+            m_Status = eStatus;
+            m_StatusCond.notify_all();
+        }
+    }
 }

@@ -20,6 +20,8 @@ namespace {
         HMAC(EVP_sha1(), key.data(), static_cast<int>(key.length()), block, block_size, sha1, &size);
         return sha1;
     }
+
+    static const uint16_t sRFC3489_MULTIPLE_BYTES = 64;
 }
 
 namespace STUN {
@@ -32,6 +34,7 @@ namespace STUN {
         m_Attributes[id] = m_AttrLength;
         auto pBuf = &m_StunPacket.Attributes()[m_AttrLength];
         m_AttrLength += size;
+        m_StunPacket.Length(m_AttrLength);
         return pBuf;
     }
 
@@ -46,15 +49,15 @@ namespace STUN {
     {
         uint16_t padding_size = 0;
         auto total_size = CalcAttrEncodeSize(size + sizeof(ATTR::Header), padding_size);
-        auto pBuf =  AllocAttribute(id, total_size);
+        auto pBuf = AllocAttribute(id, total_size);
         if (!pBuf)
         {
             LOG_ERROR("STUN-MSG", "Not Enough Memory for TextAttribute [%d]", id);
-            return ;
+            return;
         }
 
         reinterpret_cast<uint16_t*>(pBuf)[0] = PG::host_to_network(static_cast<uint16_t>(id));
-        reinterpret_cast<uint16_t*>(pBuf)[1] = PG::host_to_network(size);
+        reinterpret_cast<uint16_t*>(pBuf)[1] = PG::host_to_network<uint16_t>(size + padding_size);
         pBuf += 4;
 
         memcpy(pBuf, data, size);
@@ -67,49 +70,46 @@ namespace STUN {
     void MessagePacket::Finalize(MessagePacket & packet, const std::string & pwd)
     {
         auto& attributes = packet.m_Attributes;
-        if (attributes.find(ATTR::Id::MessageIntegrity) != attributes.end())
-            return;
 
-        SHA1 sha1;
+        assert(attributes.find(ATTR::Id::MessageIntegrity) == attributes.end());
+
         /*
-        RFC8445 [15.4]
+        https://tools.ietf.org/html/draft-ietf-behave-rfc3489bis-02#section-10.2.8
+        1.calculate stun packet length, it should include 'msg-integrity' and 'fingerprint' length
+        2.calculate sha1 text length, exclude 'msg-integrity' and 'fingerprint' length and multip with 64 bytes.
         */
-        packet.m_StunPacket.Length(packet.m_AttrLength + STUN::sSHA1Size + sizeof(ATTR::Header));
-        CalcHmacSha1(pwd, reinterpret_cast<const uint8_t*>(&packet.m_StunPacket), packet.m_AttrLength + STUN::sStunHeaderLength, sha1);
 
-        auto pBuf = packet.AllocAttribute(STUN::ATTR::Id::MessageIntegrity, sizeof(ATTR::MessageIntegrity));
-        assert(pBuf);
+        auto size_before_auth = packet.GetLength();
+        auto pMsgInegrityBuf = packet.AllocAttribute(STUN::ATTR::Id::MessageIntegrity, sizeof(ATTR::MessageIntegrity));
+        auto pFingerprintBuf = packet.AllocAttribute(STUN::ATTR::Id::Fingerprint, sizeof(ATTR::Fingerprint));
 
-        reinterpret_cast<uint16_t*>(pBuf)[0] = PG::host_to_network(static_cast<uint16_t>(ATTR::Id::MessageIntegrity));
-        reinterpret_cast<uint16_t*>(pBuf)[1] = PG::host_to_network(static_cast<uint16_t>(STUN::sSHA1Size));
+        if (!pMsgInegrityBuf || !pFingerprintBuf)
+        {
+            LOG_ERROR("MessagePacket", "Finalize cannot allocate attribute MessageIntegrity [%p], Fingerprint [%p]",
+                pMsgInegrityBuf, pFingerprintBuf);
+            return;
+        }
 
-
-
-        auto pMsgIntegrity = reinterpret_cast<ATTR::MessageIntegrity*>(pBuf);
+        // Add MessageIntegrity
+        SHA1 sha1;
+        auto sha1_length = CalcPaddingSize(size_before_auth, sRFC3489_MULTIPLE_BYTES);
+        memset(&(reinterpret_cast<uint8_t*>(&packet.m_StunPacket)[size_before_auth]), 0, sha1_length - size_before_auth);
+        CalcHmacSha1(pwd, reinterpret_cast<const uint8_t*>(&packet.m_StunPacket), sha1_length, sha1);
+        auto pMsgIntegrity = reinterpret_cast<ATTR::MessageIntegrity*>(pMsgInegrityBuf);
+        reinterpret_cast<uint16_t*>(pMsgIntegrity)[0] = PG::host_to_network(static_cast<uint16_t>(ATTR::Id::MessageIntegrity));
+        reinterpret_cast<uint16_t*>(pMsgIntegrity)[1] = PG::host_to_network(static_cast<uint16_t>(STUN::sSHA1Size));
         pMsgIntegrity->SHA1(sha1);
 
-        /*
-        RFC5389 [15.5.  FINGERPRINT]
-        The FINGERPRINT attribute MAY be present in all STUN messages.  The
-        value of the attribute is computed as the CRC-32 of the STUN message
-        up to (but excluding) the FINGERPRINT attribute itself, XOR'ed with
-        the 32-bit value 0x5354554e
-        */
+        // Add Fingerprint
+        reinterpret_cast<uint16_t*>(pFingerprintBuf)[0] = PG::host_to_network(static_cast<uint16_t>(ATTR::Id::Fingerprint));
+        reinterpret_cast<uint16_t*>(pFingerprintBuf)[1] = PG::host_to_network(static_cast<uint16_t>(sizeof(ATTR::Fingerprint) - sizeof(ATTR::Header)));
+        auto pFigerprint = reinterpret_cast<ATTR::Fingerprint*>(pFingerprintBuf);
 
         boost::crc_32_type crc32_result;
-        crc32_result.process_bytes(&packet.m_StunPacket, packet.m_AttrLength + STUN::sStunHeaderLength);
+        crc32_result.process_bytes(&packet.m_StunPacket, packet.GetLength() - sizeof(ATTR::Fingerprint));
         uint32_t crc32 = crc32_result.checksum() ^ sStunXorFingerprint;
 
-        // add fingerprint to packet
-        pBuf = packet.AllocAttribute(STUN::ATTR::Id::Fingerprint, sizeof(ATTR::Fingerprint));
-        assert(pBuf);
-        reinterpret_cast<uint16_t*>(pBuf)[0] = PG::host_to_network(static_cast<uint16_t>(ATTR::Id::Fingerprint));
-        reinterpret_cast<uint16_t*>(pBuf)[1] = PG::host_to_network(static_cast<uint16_t>(sizeof(ATTR::Fingerprint) - sizeof(ATTR::Header)));
-
-        auto pFigerprint = reinterpret_cast<ATTR::Fingerprint*>(pBuf);
         pFigerprint->CRC32(crc32);
-
-        packet.m_StunPacket.Length(packet.m_AttrLength);
     }
 
     void MessagePacket::AddAttribute(const ATTR::Priority &attr)
@@ -154,14 +154,14 @@ namespace STUN {
         m_AttrLength = packet.Length();
         try
         {
-            auto attr         = packet.Attributes();
-            auto content_len  = packet.Length();
+            auto attr = packet.Attributes();
+            auto content_len = packet.Length();
             uint16_t attr_len = 0;
 
-            for(decltype(content_len) i = 0 ; i < content_len;  i += attr_len + sizeof(ATTR::Header))
+            for (decltype(content_len) i = 0; i < content_len; i += attr_len + sizeof(ATTR::Header))
             {
                 ATTR::Id id = static_cast<ATTR::Id>(PG::network_to_host(reinterpret_cast<const uint16_t*>(&attr[i])[0]));
-                attr_len    = CalcPaddingSize(PG::network_to_host(reinterpret_cast<const uint16_t*>(&attr[i])[1]));
+                attr_len = CalcPaddingSize(PG::network_to_host(reinterpret_cast<const uint16_t*>(&attr[i])[1]));
 
                 switch (id)
                 {
@@ -187,6 +187,8 @@ namespace STUN {
                 case STUN::ATTR::Id::Fingerprint:
                 case STUN::ATTR::Id::IceControlled:
                 case STUN::ATTR::Id::IceControlling:
+                case STUN::ATTR::Id::MsCandInd:
+                case STUN::ATTR::Id::MsIce2:
                     m_Attributes[id] = i;
                     break;
 
@@ -321,14 +323,14 @@ namespace STUN {
 
         reinterpret_cast<uint16_t*>(pBuf)[0] = PG::host_to_network(static_cast<uint16_t>(ATTR::Id::ErrorCode));
         // error code length = reason length + 4 bytes
-        reinterpret_cast<uint16_t*>(pBuf)[0] = PG::host_to_network(static_cast<uint16_t>(reason_length + 4));
+        reinterpret_cast<uint16_t*>(pBuf)[1] = PG::host_to_network(static_cast<uint16_t>(reason_length + 4));
 
         ATTR::ErrorCode *pErrorCode = reinterpret_cast<ATTR::ErrorCode*>(pBuf);
         pErrorCode->Class(clsCode);
         pErrorCode->Number(number);
         pErrorCode->Reason(reason);
-        if(padding_size)
-            memset(pBuf + 4 + reason_length, 0, padding_size);
+        if (padding_size)
+            memset(pBuf + 8 + reason_length, 0, padding_size);
     }
 
     void MessagePacket::AddNonce(const std::string& nonce)
@@ -555,7 +557,16 @@ namespace STUN {
         return errCode;
     }
 
-    void MessagePacket::ComputeSHA1(const MessagePacket & packet, const std::string & key,SHA1Ref sha1)
+    const ATTR::ChangedAddress * MessagePacket::GetAttribute(const ATTR::ChangedAddress *& changedAddr) const
+    {
+
+        auto itor = m_Attributes.find(ATTR::Id::ChangedAddress);
+        changedAddr = (itor == m_Attributes.end()) ?
+            nullptr : reinterpret_cast<const ATTR::ChangedAddress*>(&m_StunPacket.Attributes()[itor->second]);
+        return changedAddr;
+    }
+
+    void MessagePacket::ComputeSHA1(const MessagePacket & packet, const std::string & key, SHA1Ref sha1)
     {
     }
 
@@ -565,72 +576,24 @@ namespace STUN {
 
         if (!packet.GetAttribute(pMsgIntegrity))
             return false;
-
-        STUN::PACKET::stun_packet *rawPacket = (STUN::PACKET::stun_packet*)(const_cast<uint8_t*>(packet.GetData()));
-        const auto body_len = rawPacket->Length();
         /*
-        This is not in the old (obsoleted) STUN RFC (http://tools.ietf.org/html/draft-ietf-behave-rfc3489bis-02#section-10.2.8).
-        The problem is that the Lync processing is using the older RFC for the MESSAGE-INTEGRITY attribute and doesn¡¯t include specifically the modification of the length in the message header before calculating the HMAC. 
-        The [MS-ICE2] open specification does reference the correct STUN RFC (i.e. the old one) in 2.2.2 
-        but references (indirectly via ICE/NAT RFC1 ) the newer one in 3.1.4.8.2.4 where it speaks directly about calculating the MESSAGE-INTEGRITY attribute.
+        https://datatracker.ietf.org/doc/rfc5389/?include_text=1
+        15.4
         */
-        auto sha1_text_len = body_len + STUN::sStunHeaderLength - (pMsgIntegrity->ContentLength() + STUN::sStunAttrHeaderLength);
-        const ATTR::Fingerprint *pFingerprint = nullptr;
-        auto orignal_body_len = body_len;
-        if (packet.GetAttribute(pFingerprint))
+        ;
+        STUN::PACKET::stun_packet temp;
+        auto sha1_text_length = packet.GetLength() - sizeof(ATTR::MessageIntegrity);
+        if (packet.HasAttribute(ATTR::Id::Fingerprint))
         {
-            sha1_text_len -= pFingerprint->ContentLength() + sizeof(ATTR::Header);
-            orignal_body_len -= pFingerprint->ContentLength() + sizeof(ATTR::Header);
+            sha1_text_length -= sizeof(ATTR::Fingerprint);
         }
+        sha1_text_length = CalcPaddingSize(sha1_text_length, sRFC3489_MULTIPLE_BYTES);
+        memset(&temp, 0, sha1_text_length);
+        memcpy(&temp, &packet.m_StunPacket, packet.GetLength() - sizeof(ATTR::MessageIntegrity) - sizeof(ATTR::Fingerprint));
 
-        rawPacket->Length(orignal_body_len);
         SHA1 sha1;
-        CalcHmacSha1(key.data(), (const uint8_t*)rawPacket, sha1_text_len,sha1);
-        auto ret = memcmp(sha1, pMsgIntegrity->SHA1(), sizeof(sha1));
-
-        // restore body len
-        rawPacket->Length(body_len);
-        if (0 == ret)
-            return true;
-
-        /*
-        RFC8445 [15.4]
-        Based on the rules above, the hash used to construct MESSAGE-
-        INTEGRITY includes the length field from the STUN message header.
-        Prior to performing the hash, the MESSAGE-INTEGRITY attribute MUST be
-        inserted into the message (with dummy content).  The length MUST then
-        be set to point to the length of the message up to, and including,
-        the MESSAGE-INTEGRITY attribute itself, but excluding any attributes
-        after it.  Once the computation is performed, the value of the
-        MESSAGE-INTEGRITY attribute can be filled in, and the value of the
-        length in the STUN header can be set to its correct value -- the
-        length of the entire message.  Similarly, when validating the
-        MESSAGE-INTEGRITY, the length field should be adjusted to point to
-        the end of the MESSAGE-INTEGRITY attribute prior to calculating the
-        HMAC.  Such adjustment is necessary when attributes, such as
-        FINGERPRINT, appear after MESSAGE-INTEGRITY
-        */
-        sha1_text_len = body_len + STUN::sStunHeaderLength;
-
-        auto itor = packet.m_Attributes.find(STUN::ATTR::Id::MessageIntegrity);
-        assert(itor != packet.m_Attributes.end());
-
-        // save message-integrity
-        SHA1 temp;
-        memcpy(temp, &packet.m_StunPacket.Attributes()[itor->second + 4], sizeof(SHA1));
-        if (pFingerprint)
-        {
-            sha1_text_len -= pFingerprint->ContentLength() + sizeof(ATTR::Header);
-            rawPacket->Length(sha1_text_len);
-        }
-
-        memset(const_cast<uint8_t*>(&packet.m_StunPacket.Attributes()[itor->second + 4]), 0, sizeof(SHA1));
-        CalcHmacSha1(key.data(), (const uint8_t*)rawPacket, sha1_text_len, sha1);
-
-        // restore
-        rawPacket->Length(body_len);
-        memcpy(const_cast<uint8_t*>(&packet.m_StunPacket.Attributes()[itor->second + 4]), temp, sizeof(SHA1));
-        return 0 == memcmp(sha1, pMsgIntegrity->SHA1(), sizeof(sha1));
+        CalcHmacSha1(key, reinterpret_cast<const uint8_t*>(&temp), sha1_text_length, sha1);
+        return 0 == memcmp(sha1, pMsgIntegrity->SHA1(), STUN::sSHA1Size);
     }
 
     bool MessagePacket::IsValidStunPacket(const PACKET::stun_packet& packet, uint16_t packet_size)
@@ -652,6 +615,18 @@ namespace STUN {
         // packet has magicCookie
         if (reinterpret_cast<const uint32_t*>(packet.TransId())[0] == PG::host_to_network(sMagicCookie))
         {
+            const ATTR::Fingerprint *pFingerprint = reinterpret_cast<const ATTR::Fingerprint *>(&rawData[content_length + STUN::sStunHeaderLength - sizeof(ATTR::Fingerprint)]);
+            if (pFingerprint->Type() == ATTR::Id::Fingerprint)
+            {
+                if (pFingerprint->ContentLength() != 4)
+                    return false;
+                boost::crc_32_type crc32_result;
+                crc32_result.process_bytes(&packet, packet.Length() - sizeof(ATTR::Fingerprint) + STUN::sStunHeaderLength);
+                uint32_t crc32 = crc32_result.checksum() ^ sStunXorFingerprint;
+                if (crc32 == pFingerprint->CRC32())
+                    return true;
+                return false;
+            }
         }
         return true;
     }
@@ -683,7 +658,7 @@ namespace STUN {
     }
 
     ////////////////////////////// SubBindReqMsg //////////////////////////////
-    SubBindReqMsg::SubBindReqMsg(uint32_t pri, const TransId & transId, bool bControlling, uint64_t tieBreaker, const std::string& username, const std::string& pwd):
+    SubBindReqMsg::SubBindReqMsg(uint32_t pri, const TransId & transId, bool bControlling, uint64_t tieBreaker, const std::string& username, const std::string& pwd) :
         MessagePacket(STUN::MsgType::BindingRequest, transId), m_IcePwd(pwd)
     {
         AddAttribute(ATTR::Role(bControlling, tieBreaker));
@@ -691,8 +666,8 @@ namespace STUN {
         AddUsername(username);
     }
 
-    SubBindReqMsg::SubBindReqMsg(const PACKET::stun_packet & packet, uint16_t packet_size):
-        MessagePacket(packet,packet_size)
+    SubBindReqMsg::SubBindReqMsg(const PACKET::stun_packet & packet, uint16_t packet_size) :
+        MessagePacket(packet, packet_size)
     {
         assert(packet.MsgId() == MsgType::BindingRequest);
     }
@@ -713,7 +688,7 @@ namespace STUN {
         AddAttribute(xormapAddr);
     }
 
-    SubBindRespMsg::SubBindRespMsg(const PACKET::stun_packet & packet, uint16_t packet_size):
+    SubBindRespMsg::SubBindRespMsg(const PACKET::stun_packet & packet, uint16_t packet_size) :
         MessagePacket(packet, packet_size)
     {
         assert(packet.MsgId() == MsgType::BindingResp);
@@ -744,14 +719,6 @@ namespace STUN {
 
     void SubBindErrRespMsg::Finalize()
     {
-    }
-
-    void IndicationMsg::Finalize()
-    {
-        boost::crc_32_type crc32_result;
-        crc32_result.process_bytes(&m_StunPacket, m_AttrLength + STUN::sStunHeaderLength);
-        uint32_t crc32 = crc32_result.checksum() ^ sStunXorFingerprint;
-
         // add fingerprint to packet
         auto pBuf = AllocAttribute(STUN::ATTR::Id::Fingerprint, sizeof(ATTR::Fingerprint));
         assert(pBuf);
@@ -759,8 +726,24 @@ namespace STUN {
         reinterpret_cast<uint16_t*>(pBuf)[1] = PG::host_to_network(static_cast<uint16_t>(sizeof(ATTR::Fingerprint) - sizeof(ATTR::Header)));
 
         auto pFigerprint = reinterpret_cast<ATTR::Fingerprint*>(pBuf);
+        boost::crc_32_type crc32_result;
+        crc32_result.process_bytes(&m_StunPacket, m_StunPacket.Length() - sizeof(ATTR::Fingerprint));
+        uint32_t crc32 = crc32_result.checksum() ^ sStunXorFingerprint;
         pFigerprint->CRC32(crc32);
+    }
 
-        m_StunPacket.Length(m_AttrLength);
+    void IndicationMsg::Finalize()
+    {
+        // add fingerprint to packet
+        auto pBuf = AllocAttribute(STUN::ATTR::Id::Fingerprint, sizeof(ATTR::Fingerprint));
+        assert(pBuf);
+        reinterpret_cast<uint16_t*>(pBuf)[0] = PG::host_to_network(static_cast<uint16_t>(ATTR::Id::Fingerprint));
+        reinterpret_cast<uint16_t*>(pBuf)[1] = PG::host_to_network(static_cast<uint16_t>(sizeof(ATTR::Fingerprint) - sizeof(ATTR::Header)));
+
+        auto pFigerprint = reinterpret_cast<ATTR::Fingerprint*>(pBuf);
+        boost::crc_32_type crc32_result;
+        crc32_result.process_bytes(&m_StunPacket, m_StunPacket.Length() - sizeof(ATTR::Fingerprint));
+        uint32_t crc32 = crc32_result.checksum() ^ sStunXorFingerprint;
+        pFigerprint->CRC32(crc32);
     }
 }
